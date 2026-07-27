@@ -21,8 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-# ─── Config ────────────────────────────────────────────────────────────
 
+# ─── Config ────────────────────────────────────────────────────────────
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "9119"))
 API_KEY = os.getenv("HERMES_API_KEY", "hermes123")  # mobile app auth key
@@ -72,6 +72,21 @@ def save_messages(session_id: str, msgs: list[dict]) -> None:
 
 app = FastAPI(title="Hermes Mobile Bridge", version="1.0.0")
 
+# ── Diagnostic logging middleware ──
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("hermes-bridge")
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    real_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown")
+    logger.info(f"→ {request.method} {request.url.path} from {real_ip}")
+    response = await call_next(request)
+    logger.info(f"← {request.method} {request.url.path} → {response.status_code}")
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -106,10 +121,43 @@ async def health():
     return {"status": "ok", "timestamp": time.time()}
 
 
+@app.get("/diag")
+async def diag(request: Request):
+    """Diagnostic page — open this in a browser on your phone to test connectivity."""
+    real_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown")
+    return {
+        "status": "ok",
+        "message": "Hermes Mobile Bridge is reachable from your phone! ✅",
+        "your_ip": real_ip,
+        "server_time": time.ctime(),
+        "endpoints": {
+            "health": "/health",
+            "chat": "POST /api/chat",
+            "chat_stream": "POST /api/chat/stream",
+            "sessions": "GET /api/sessions",
+        },
+    }
+
+
 @app.get("/api/sessions")
 async def list_sessions(request: Request):
     verify_auth(request)
     return load_sessions()
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str, request: Request):
+    verify_auth(request)
+    # Delete from sessions list
+    sessions = load_sessions()
+    sessions = [s for s in sessions if s.get("id") != session_id]
+    save_sessions(sessions)
+    # Delete messages file if it exists
+    msgs_path = _messages_path(session_id)
+    if msgs_path.exists():
+        msgs_path.unlink()
+    logger.info(f"Deleted session {session_id}")
+    return {"status": "ok", "deleted": session_id}
 
 
 @app.post("/api/chat/stream")
@@ -130,7 +178,7 @@ async def chat_stream(body: ChatRequest, request: Request):
     else:
         sessions.insert(0, {
             "id": session_id,
-            "title": body.query[:60] + ("…" if len(body.query) > 60 else ""),
+            "title": body.query[:60] + ("\u2026" if len(body.query) > 60 else ""),
             "messageCount": 1,
             "createdAt": int(time.time() * 1000),
             "updatedAt": int(time.time() * 1000),
@@ -226,7 +274,7 @@ async def chat_sync(body: ChatRequest, request: Request):
     else:
         sessions.insert(0, {
             "id": session_id,
-            "title": body.query[:60] + ("…" if len(body.query) > 60 else ""),
+            "title": body.query[:60] + ("\u2026" if len(body.query) > 60 else ""),
             "messageCount": 1,
             "createdAt": int(time.time() * 1000),
             "updatedAt": int(time.time() * 1000),
