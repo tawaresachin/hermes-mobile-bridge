@@ -4,10 +4,10 @@ Hermes Mobile Bridge Server
 REST/SSE backend that the Hermes Mobile Android app connects to.
 Forwards chat to OpenCode Zen (or any OpenAI-compatible API).
 """
-
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -21,11 +21,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("hermes-bridge")
 
 # ─── Config ────────────────────────────────────────────────────────────
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "9119"))
-API_KEY = os.getenv("HERMES_API_KEY", "hermes123")  # mobile app auth key
+
+API_KEY = os.getenv("HERMES_API_KEY")
+if not API_KEY:
+    raise RuntimeError(
+        "HERMES_API_KEY environment variable is required. "
+        "Set it to a secure value before starting the server."
+    )
+
 STORE_PATH = Path(os.getenv("STORE_PATH", os.path.expanduser("~/.hermes-mobile-server")))
 
 # OpenCode Zen (or any OpenAI-compatible provider)
@@ -34,6 +43,9 @@ AI_API_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENCODE_ZEN_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "deepseek-v4-flash-free")
 
 STORE_PATH.mkdir(parents=True, exist_ok=True)
+
+# Shared HTTP client — one connection pool for all requests
+_http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
 
 # ─── Data store ────────────────────────────────────────────────────────
 
@@ -68,22 +80,63 @@ def save_messages(session_id: str, msgs: list[dict]) -> None:
     _messages_path(session_id).write_text(json.dumps(msgs, indent=2, default=str))
 
 
+# ─── Shared helpers ─────────────────────────────────────────────────────
+
+
+def _save_user_message(session_id: str, query: str) -> None:
+    """Append the user's query to the message history and persist."""
+    msgs = load_messages(session_id)
+    msgs.append({"role": "user", "content": query, "timestamp": time.time()})
+    save_messages(session_id, msgs)
+
+
+def _save_assistant_message(session_id: str, content: str) -> None:
+    """Append the assistant response to the message history and persist."""
+    msgs = load_messages(session_id)
+    msgs.append({"role": "assistant", "content": content, "timestamp": time.time()})
+    save_messages(session_id, msgs)
+
+
+def _upsert_session(session_id: str, query: str) -> None:
+    """Create or update a session entry from a user query."""
+    sessions = load_sessions()
+    existing = next((s for s in sessions if s["id"] == session_id), None)
+    if existing:
+        existing["messageCount"] = (existing.get("messageCount", 0) or 0) + 1
+        existing["updatedAt"] = int(time.time() * 1000)
+    else:
+        sessions.insert(0, {
+            "id": session_id,
+            "title": query[:60] + ("\u2026" if len(query) > 60 else ""),
+            "messageCount": 1,
+            "createdAt": int(time.time() * 1000),
+            "updatedAt": int(time.time() * 1000),
+        })
+    save_sessions(sessions)
+
+
+def _build_openai_messages(session_id: str) -> list[dict]:
+    """Build the conversation history array for the OpenAI-compatible API."""
+    msgs = load_messages(session_id)
+    return [
+        {"role": "system", "content": "You are Hermes, a helpful AI assistant. Be concise and accurate."},
+        *[{"role": m["role"], "content": m["content"]} for m in msgs[-20:]],
+    ]
+
+
 # ─── App ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Hermes Mobile Bridge", version="1.0.0")
 
 # ── Diagnostic logging middleware ──
-import logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("hermes-bridge")
 
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     real_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown")
-    logger.info(f"→ {request.method} {request.url.path} from {real_ip}")
+    logger.info(f"\u2192 {request.method} {request.url.path} from {real_ip}")
     response = await call_next(request)
-    logger.info(f"← {request.method} {request.url.path} → {response.status_code}")
+    logger.info(f"\u2190 {request.method} {request.url.path} \u2192 {response.status_code}")
     return response
 
 
@@ -127,7 +180,7 @@ async def diag(request: Request):
     real_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown")
     return {
         "status": "ok",
-        "message": "Hermes Mobile Bridge is reachable from your phone! ✅",
+        "message": "Hermes Mobile Bridge is reachable from your phone! \u2705",
         "your_ip": real_ip,
         "server_time": time.ctime(),
         "endpoints": {
@@ -148,11 +201,9 @@ async def list_sessions(request: Request):
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str, request: Request):
     verify_auth(request)
-    # Delete from sessions list
     sessions = load_sessions()
     sessions = [s for s in sessions if s.get("id") != session_id]
     save_sessions(sessions)
-    # Delete messages file if it exists
     msgs_path = _messages_path(session_id)
     if msgs_path.exists():
         msgs_path.unlink()
@@ -165,85 +216,62 @@ async def chat_stream(body: ChatRequest, request: Request):
     verify_auth(request)
     session_id = body.session_id or uuid.uuid4().hex[:8]
 
-    # Save user message & create/update session
-    msgs = load_messages(session_id)
-    msgs.append({"role": "user", "content": body.query, "timestamp": time.time()})
-    save_messages(session_id, msgs)
+    _save_user_message(session_id, body.query)
+    _upsert_session(session_id, body.query)
 
-    sessions = load_sessions()
-    existing = next((s for s in sessions if s["id"] == session_id), None)
-    if existing:
-        existing["messageCount"] = (existing.get("messageCount", 0) or 0) + 1
-        existing["updatedAt"] = int(time.time() * 1000)
-    else:
-        sessions.insert(0, {
-            "id": session_id,
-            "title": body.query[:60] + ("\u2026" if len(body.query) > 60 else ""),
-            "messageCount": 1,
-            "createdAt": int(time.time() * 1000),
-            "updatedAt": int(time.time() * 1000),
-        })
-    save_sessions(sessions)
+    openai_messages = _build_openai_messages(session_id)
 
     async def event_generator() -> AsyncGenerator[str, None]:
         full_response = ""
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                openai_messages = [
-                    {"role": "system", "content": "You are Hermes, a helpful AI assistant. Be concise and accurate."},
-                ]
-                # Add conversation history (up to last 20)
-                for m in msgs[-20:]:
-                    openai_messages.append({"role": m["role"], "content": m["content"]})
+            headers = {}
+            if AI_API_KEY:
+                headers["Authorization"] = f"Bearer {AI_API_KEY}"
+            headers["Content-Type"] = "application/json"
 
-                payload = {
-                    "model": AI_MODEL,
-                    "messages": openai_messages,
-                    "stream": True,
-                }
-                headers = {}
-                if AI_API_KEY:
-                    headers["Authorization"] = f"Bearer {AI_API_KEY}"
-                headers["Content-Type"] = "application/json"
+            payload = {
+                "model": AI_MODEL,
+                "messages": openai_messages,
+                "stream": True,
+            }
 
-                async with client.stream(
-                    "POST",
-                    f"{AI_BASE_URL}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                ) as resp:
-                    if resp.status_code != 200:
-                        error_text = await resp.aread()
-                        yield f"data: {json.dumps({'content': f'⚠️ API error {resp.status_code}: {error_text.decode()[:200]}'})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
+            async with _http_client.stream(
+                "POST",
+                f"{AI_BASE_URL}/chat/completions",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                if resp.status_code != 200:
+                    error_text = await resp.aread()
+                    yield f"data: {json.dumps({'content': f'\u26a0\ufe0f API error {resp.status_code}: {error_text.decode()[:200]}'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        choices = chunk.get("choices", [])
+                        if not choices:
                             continue
-                        data_str = line[6:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                            choices = chunk.get("choices", [])
-                            if not choices:
-                                continue
-                            delta = choices[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                full_response += content
-                                yield f"data: {json.dumps({'content': content})}\n\n"
-                        except json.JSONDecodeError:
-                            continue
+                        delta = choices[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            full_response += content
+                            yield f"data: {json.dumps({'content': content})}\n\n"
+                    except json.JSONDecodeError:
+                        continue
 
         except Exception as e:
-            yield f"data: {json.dumps({'content': f'⚠️ Connection error: {e}'})}\n\n"
+            yield f"data: {json.dumps({'content': f'\u26a0\ufe0f Connection error: {e}'})}\n\n"
 
         # Save assistant response
         if full_response:
-            msgs.append({"role": "assistant", "content": full_response, "timestamp": time.time()})
-            save_messages(session_id, msgs)
+            _save_assistant_message(session_id, full_response)
 
         yield "data: [DONE]\n\n"
 
@@ -263,63 +291,43 @@ async def chat_sync(body: ChatRequest, request: Request):
     verify_auth(request)
     session_id = body.session_id or uuid.uuid4().hex[:8]
 
-    msgs = load_messages(session_id)
-    msgs.append({"role": "user", "content": body.query, "timestamp": time.time()})
+    _save_user_message(session_id, body.query)
+    _upsert_session(session_id, body.query)
 
-    sessions = load_sessions()
-    existing = next((s for s in sessions if s["id"] == session_id), None)
-    if existing:
-        existing["messageCount"] = (existing.get("messageCount", 0) or 0) + 1
-        existing["updatedAt"] = int(time.time() * 1000)
-    else:
-        sessions.insert(0, {
-            "id": session_id,
-            "title": body.query[:60] + ("\u2026" if len(body.query) > 60 else ""),
-            "messageCount": 1,
-            "createdAt": int(time.time() * 1000),
-            "updatedAt": int(time.time() * 1000),
-        })
-    save_sessions(sessions)
+    openai_messages = _build_openai_messages(session_id)
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            openai_messages = [
-                {"role": "system", "content": "You are Hermes, a helpful AI assistant. Be concise and accurate."},
-            ]
-            for m in msgs[-20:]:
-                openai_messages.append({"role": m["role"], "content": m["content"]})
+        headers = {}
+        if AI_API_KEY:
+            headers["Authorization"] = f"Bearer {AI_API_KEY}"
+        headers["Content-Type"] = "application/json"
 
-            payload = {
-                "model": AI_MODEL,
-                "messages": openai_messages,
-                "stream": False,
-            }
-            headers = {}
-            if AI_API_KEY:
-                headers["Authorization"] = f"Bearer {AI_API_KEY}"
-            headers["Content-Type"] = "application/json"
-            resp = await client.post(
-                f"{AI_BASE_URL}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                msgs.append({"role": "assistant", "content": content, "timestamp": time.time()})
-                save_messages(session_id, msgs)
-                return {"response": content, "session_id": session_id}
-            else:
-                return {"response": f"⚠️ API error: {resp.status_code}", "session_id": session_id}
+        payload = {
+            "model": AI_MODEL,
+            "messages": openai_messages,
+            "stream": False,
+        }
+
+        resp = await _http_client.post(
+            f"{AI_BASE_URL}/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            _save_assistant_message(session_id, content)
+            return {"response": content, "session_id": session_id}
+        else:
+            return {"response": f"\u26a0\ufe0f API error: {resp.status_code}", "session_id": session_id}
     except Exception as e:
-        return {"response": f"⚠️ Error: {e}", "session_id": session_id}
+        return {"response": f"\u26a0\ufe0f Error: {e}", "session_id": session_id}
 
 
 # ─── Main ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"🤖 Hermes Mobile Bridge starting on http://{HOST}:{PORT}")
-    print(f"   API Key: {API_KEY}")
+    print(f"\U0001f916 Hermes Mobile Bridge starting on http://{HOST}:{PORT}")
     print(f"   AI: {AI_MODEL} @ {AI_BASE_URL}")
     print(f"   Store: {STORE_PATH}")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
