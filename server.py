@@ -3,6 +3,8 @@
 Hermes Mobile Bridge Server
 REST/SSE backend that the Hermes Mobile Android app connects to.
 Forwards chat to OpenCode Zen (or any OpenAI-compatible API).
+
+New in v2: User authentication with JWT + refresh tokens.
 """
 from __future__ import annotations
 
@@ -12,42 +14,58 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, EmailStr
+
+# Local auth modules
+from auth_db import get_auth_db, AuthDB
+from auth_handler import (
+    hash_password,
+    verify_password,
+    get_jwt_secret,
+    create_access_token,
+    decode_access_token,
+    register_user,
+    login_user,
+    refresh_tokens,
+    REFRESH_EXPIRE_DAYS,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hermes-bridge")
 
-# ─── Config ────────────────────────────────────────────────────────────
+# ─── Config ──────────────────────────────────────────────────────────────
+
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "9119"))
 
-API_KEY = os.getenv("HERMES_API_KEY")
-if not API_KEY:
-    raise RuntimeError(
-        "HERMES_API_KEY environment variable is required. "
-        "Set it to a secure value before starting the server."
-    )
-
-STORE_PATH = Path(os.getenv("STORE_PATH", os.path.expanduser("~/.hermes-mobile-server")))
-
-# OpenCode Zen (or any OpenAI-compatible provider)
+# AI provider (OpenAI-compatible)
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://opencode.ai/zen/v1")
 AI_API_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENCODE_ZEN_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "deepseek-v4-flash-free")
 
+# Optional static API key for backward compatibility
+# If set, accepts Authorization: Bearer <this_key> as fallback
+HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
+
+# Data storage
+STORE_PATH = Path(os.getenv("STORE_PATH", os.path.expanduser("~/.hermes-mobile-server")))
 STORE_PATH.mkdir(parents=True, exist_ok=True)
 
 # Shared HTTP client — one connection pool for all requests
 _http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
 
-# ─── Data store ────────────────────────────────────────────────────────
+# Initialize auth DB
+auth_db = get_auth_db(STORE_PATH)
+JWT_SECRET = get_jwt_secret(STORE_PATH)
+
+# ─── Data store (sessions & messages) ────────────────────────────────────
 
 
 def _sessions_path() -> Path:
@@ -105,13 +123,16 @@ def _upsert_session(session_id: str, query: str) -> None:
         existing["messageCount"] = (existing.get("messageCount", 0) or 0) + 1
         existing["updatedAt"] = int(time.time() * 1000)
     else:
-        sessions.insert(0, {
-            "id": session_id,
-            "title": query[:60] + ("\u2026" if len(query) > 60 else ""),
-            "messageCount": 1,
-            "createdAt": int(time.time() * 1000),
-            "updatedAt": int(time.time() * 1000),
-        })
+        sessions.insert(
+            0,
+            {
+                "id": session_id,
+                "title": query[:60] + ("…" if len(query) > 60 else ""),
+                "messageCount": 1,
+                "createdAt": int(time.time() * 1000),
+                "updatedAt": int(time.time() * 1000),
+            },
+        )
     save_sessions(sessions)
 
 
@@ -124,21 +145,33 @@ def _build_openai_messages(session_id: str) -> list[dict]:
     ]
 
 
-# ─── App ───────────────────────────────────────────────────────────────
-
-app = FastAPI(title="Hermes Mobile Bridge", version="1.0.0")
-
-# ── Diagnostic logging middleware ──
+# ─── Models ──────────────────────────────────────────────────────────────
 
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    real_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown")
-    logger.info(f"\u2192 {request.method} {request.url.path} from {real_ip}")
-    response = await call_next(request)
-    logger.info(f"\u2190 {request.method} {request.url.path} \u2192 {response.status_code}")
-    return response
+class ChatRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+    stream: bool = True
 
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+# ─── App ─────────────────────────────────────────────────────────────────
+
+
+app = FastAPI(title="Hermes Mobile Bridge", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -149,24 +182,92 @@ app.add_middleware(
 )
 
 
-def verify_auth(request: Request) -> None:
-    """Check Bearer token against configured API key."""
+# ─── Auth dependency ────────────────────────────────────────────────────
+
+
+async def verify_bearer(request: Request) -> dict:
+    """
+    FastAPI dependency: validate Authorization: Bearer ***
+    Returns the decoded JWT payload (contains sub=user_id, email).
+    Raises 401 on failure.
+    """
     auth = request.headers.get("Authorization", "")
-    expected = f"Bearer {API_KEY}"
-    if auth != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    token = auth[7:].strip()
+    payload = decode_access_token(token, JWT_SECRET)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    # Verify user still exists
+    user_id = int(payload["sub"])
+    user = auth_db.get_user_by_email(payload["email"])
+    if not user or user.id != user_id:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return payload
 
 
-# ─── Models ────────────────────────────────────────────────────────────
+# Public endpoints that don't require auth
+PUBLIC_PATHS = {"/health", "/diag", "/auth/register", "/auth/login", "/auth/refresh"}
 
 
-class ChatRequest(BaseModel):
-    query: str
-    session_id: str | None = None
-    stream: bool = True
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Skip auth for public paths; enforce for everything else."""
+    if request.url.path in PUBLIC_PATHS or request.url.path.startswith("/auth/"):
+        return await call_next(request)
+    # Check auth
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return Response(status_code=401, content='{"detail":"Missing or invalid Authorization header"}', media_type="application/json")
+    token = auth[7:].strip()
+    
+    # Try JWT first (new auth)
+    payload = decode_access_token(token, JWT_SECRET)
+    if payload:
+        request.state.user = payload
+        return await call_next(request)
+    
+    # Fallback: check if it's the static HERMES_API_KEY (backward compat)
+    if HERMES_API_KEY and token == HERMES_API_KEY:
+        request.state.user = {"sub": "0", "email": "legacy@api-key", "type": "legacy"}
+        return await call_next(request)
+    
+    # Neither worked
+    return Response(status_code=401, content='{"detail":"Invalid or expired token"}', media_type="application/json")
 
 
-# ─── Endpoints ─────────────────────────────────────────────────────────
+@app.post("/auth/register")
+async def auth_register(body: RegisterRequest):
+    """Register a new user. Returns access + refresh tokens."""
+    try:
+        result = await register_user(STORE_PATH, body.email, body.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
+
+
+@app.post("/auth/login")
+async def auth_login(body: LoginRequest):
+    """Log in with email + password. Returns access + refresh tokens."""
+    result = await login_user(STORE_PATH, body.email, body.password)
+    if not result:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return result
+
+
+@app.post("/auth/refresh")
+async def auth_refresh(body: RefreshRequest):
+    """Rotate refresh token. Returns new access + refresh tokens."""
+    result = await refresh_tokens(STORE_PATH, body.refresh_token)
+    if not result:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+    return result
+
+
+# ─── Core Endpoints ─────────────────────────────────────────────────────
 
 
 @app.get("/health")
@@ -180,7 +281,7 @@ async def diag(request: Request):
     real_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown")
     return {
         "status": "ok",
-        "message": "Hermes Mobile Bridge is reachable from your phone! \u2705",
+        "message": "Hermes Mobile Bridge is reachable from your phone! ✅",
         "your_ip": real_ip,
         "server_time": time.ctime(),
         "endpoints": {
@@ -188,32 +289,35 @@ async def diag(request: Request):
             "chat": "POST /api/chat",
             "chat_stream": "POST /api/chat/stream",
             "sessions": "GET /api/sessions",
+            "auth_register": "POST /auth/register",
+            "auth_login": "POST /auth/login",
+            "auth_refresh": "POST /auth/refresh",
         },
     }
 
 
 @app.get("/api/sessions")
-async def list_sessions(request: Request):
-    verify_auth(request)
+async def list_sessions(user: dict = Depends(verify_bearer)):
+    """List all chat sessions for the authenticated user."""
     return load_sessions()
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: str, request: Request):
-    verify_auth(request)
+async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
+    """Delete a session and its messages."""
     sessions = load_sessions()
     sessions = [s for s in sessions if s.get("id") != session_id]
     save_sessions(sessions)
     msgs_path = _messages_path(session_id)
     if msgs_path.exists():
         msgs_path.unlink()
-    logger.info(f"Deleted session {session_id}")
+    logger.info(f"Deleted session {session_id} for user {user['sub']}")
     return {"status": "ok", "deleted": session_id}
 
 
 @app.post("/api/chat/stream")
-async def chat_stream(body: ChatRequest, request: Request):
-    verify_auth(request)
+async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
+    """Streaming chat endpoint (SSE)."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
 
     _save_user_message(session_id, body.query)
@@ -224,10 +328,9 @@ async def chat_stream(body: ChatRequest, request: Request):
     async def event_generator() -> AsyncGenerator[str, None]:
         full_response = ""
         try:
-            headers = {}
+            headers = {"Content-Type": "application/json"}
             if AI_API_KEY:
                 headers["Authorization"] = f"Bearer {AI_API_KEY}"
-            headers["Content-Type"] = "application/json"
 
             payload = {
                 "model": AI_MODEL,
@@ -243,7 +346,7 @@ async def chat_stream(body: ChatRequest, request: Request):
             ) as resp:
                 if resp.status_code != 200:
                     error_text = await resp.aread()
-                    yield f"data: {json.dumps({'content': f'\u26a0\ufe0f API error {resp.status_code}: {error_text.decode()[:200]}'})}\n\n"
+                    yield f"data: {json.dumps({'content': f'⚠️ API error {resp.status_code}: {error_text.decode()[:200]}'})}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 
@@ -267,7 +370,7 @@ async def chat_stream(body: ChatRequest, request: Request):
                         continue
 
         except Exception as e:
-            yield f"data: {json.dumps({'content': f'\u26a0\ufe0f Connection error: {e}'})}\n\n"
+            yield f"data: {json.dumps({'content': f'⚠️ Connection error: {e}'})}\n\n"
 
         # Save assistant response
         if full_response:
@@ -287,8 +390,8 @@ async def chat_stream(body: ChatRequest, request: Request):
 
 
 @app.post("/api/chat")
-async def chat_sync(body: ChatRequest, request: Request):
-    verify_auth(request)
+async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
+    """Non-streaming chat endpoint (for simple clients)."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
 
     _save_user_message(session_id, body.query)
@@ -297,10 +400,9 @@ async def chat_sync(body: ChatRequest, request: Request):
     openai_messages = _build_openai_messages(session_id)
 
     try:
-        headers = {}
+        headers = {"Content-Type": "application/json"}
         if AI_API_KEY:
             headers["Authorization"] = f"Bearer {AI_API_KEY}"
-        headers["Content-Type"] = "application/json"
 
         payload = {
             "model": AI_MODEL,
@@ -319,15 +421,16 @@ async def chat_sync(body: ChatRequest, request: Request):
             _save_assistant_message(session_id, content)
             return {"response": content, "session_id": session_id}
         else:
-            return {"response": f"\u26a0\ufe0f API error: {resp.status_code}", "session_id": session_id}
+            return {"response": f"⚠️ API error: {resp.status_code}", "session_id": session_id}
     except Exception as e:
-        return {"response": f"\u26a0\ufe0f Error: {e}", "session_id": session_id}
+        return {"response": f"⚠️ Error: {e}", "session_id": session_id}
 
 
-# ─── Main ──────────────────────────────────────────────────────────────
+# ─── Main ────────────────────────────────────────────────────────────────
+
 
 if __name__ == "__main__":
-    print(f"\U0001f916 Hermes Mobile Bridge starting on http://{HOST}:{PORT}")
+    print(f"🤖 Hermes Mobile Bridge v2 starting on http://{HOST}:{PORT}")
     print(f"   AI: {AI_MODEL} @ {AI_BASE_URL}")
     print(f"   Store: {STORE_PATH}")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
