@@ -60,6 +60,7 @@ class AuthDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(
             """
@@ -225,13 +226,17 @@ class AuthDB:
             return None
 
 
-# ─── Factory ───
+# ─── Factory (singleton per path) ───
 
+_auth_db_cache: dict[str, AuthDB] = {}
 
 def get_auth_db(store_path: Path) -> AuthDB:
-    """Get or create the AuthDB instance."""
-    db_path = store_path / DB_FILENAME
-    return AuthDB(db_path)
+    """Get or create the AuthDB instance (singleton per store_path)."""
+    key = str(store_path.absolute())
+    if key not in _auth_db_cache:
+        db_path = store_path / DB_FILENAME
+        _auth_db_cache[key] = AuthDB(db_path)
+    return _auth_db_cache[key]
 
 
 if __name__ == "__main__":

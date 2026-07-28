@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
 import time
 import uuid
@@ -18,9 +19,10 @@ from typing import AsyncGenerator, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, File, HTTPException, Request, Depends, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 
 # Local auth modules
@@ -57,6 +59,10 @@ HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 # Data storage
 STORE_PATH = Path(os.getenv("STORE_PATH", os.path.expanduser("~/.hermes-mobile-server")))
 STORE_PATH.mkdir(parents=True, exist_ok=True)
+
+# Uploads directory — created eagerly so StaticFiles can mount it
+UPLOADS_DIR = STORE_PATH / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Shared HTTP client — one connection pool for all requests
 _http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
@@ -181,6 +187,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Static file mount for uploaded files ────────────────────────────────
+
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
 # ─── Auth dependency ────────────────────────────────────────────────────
 
@@ -216,7 +225,7 @@ PUBLIC_PATHS = {"/health", "/diag", "/auth/register", "/auth/login", "/auth/refr
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Skip auth for public paths; enforce for everything else."""
-    if request.url.path in PUBLIC_PATHS or request.url.path.startswith("/auth/"):
+    if request.url.path in PUBLIC_PATHS or request.url.path.startswith(("/auth/", "/uploads/")):
         return await call_next(request)
     # Check auth
     auth = request.headers.get("Authorization", "")
@@ -362,7 +371,6 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
@@ -417,6 +425,80 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
         final_response = f"⚠️ No response generated"
 
     return {"response": final_response, "session_id": session_id}
+
+
+# ─── File Upload Endpoint ──────────────────────────────────────────────
+
+
+@app.post("/api/upload")
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    """Upload a file to the session's uploads directory."""
+    # Verify JWT auth
+    payload = None
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        payload = decode_access_token(token, JWT_SECRET)
+    if not payload:
+        # Also check query param ?token=xxx
+        token = request.query_params.get("token")
+        if token:
+            payload = decode_access_token(token, JWT_SECRET)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    # Validate user still exists
+    user_id = int(payload["sub"])
+    user = auth_db.get_user_by_email(payload["email"])
+    if not user or user.id != user_id:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    # Determine session_id from query param, or use user-specific default
+    session_id = request.query_params.get("session_id", payload.get("sub", "default"))
+
+    # Ensure the session subdirectory exists
+    session_upload_dir = UPLOADS_DIR / session_id
+    session_upload_dir.mkdir(parents=True, exist_ok=True)
+
+    # Sanitize filename — strip directory separators
+    raw_filename = file.filename or "untitled"
+    safe_filename = os.path.basename(raw_filename)
+    if not safe_filename:
+        safe_filename = "untitled"
+
+    # Resolve full path, avoid overwrite by appending a suffix if needed
+    dest_path = session_upload_dir / safe_filename
+    if dest_path.exists():
+        stem, ext = os.path.splitext(safe_filename)
+        counter = 1
+        while dest_path.exists():
+            dest_path = session_upload_dir / f"{stem}_{counter}{ext}"
+            counter += 1
+
+    # Save the file
+    content = await file.read()
+    dest_path.write_bytes(content)
+
+    # Determine MIME type
+    mime_type, _ = mimetypes.guess_type(safe_filename)
+    mime_type = mime_type or file.content_type or "application/octet-stream"
+
+    logger.info(
+        "Uploaded file %s (%d bytes, %s) for session %s",
+        safe_filename,
+        len(content),
+        mime_type,
+        session_id,
+    )
+
+    return {
+        "url": f"/uploads/{session_id}/{dest_path.name}",
+        "filename": dest_path.name,
+        "mime_type": mime_type,
+    }
 
 
 # ─── Discovery / Registry Integration ──────────────────────────────

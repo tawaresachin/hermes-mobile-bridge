@@ -13,6 +13,28 @@ import httpx
 
 from tools import ToolCall, ToolResult, ToolRegistry, registry
 
+DEFAULT_SYSTEM_PROMPT = (
+    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
+    "You are helpful, knowledgeable, and direct. "
+    "You assist users with a wide range of tasks including answering questions, "
+    "writing and editing code, analyzing information, creative work, and executing "
+    "actions via your tools. You communicate clearly, admit uncertainty when "
+    "appropriate, and prioritize being genuinely useful over being verbose. "
+    "Be targeted and efficient in your responses."
+    "\n\n"
+    "CRITICAL: Your current runtime model is DeepSeek V4 Flash (free tier), "
+    "served via OpenCode Zen. This is NOT a Nous Research model — this session "
+    "happens to run on OpenCode Zen's infrastructure using DeepSeek V4 Flash. "
+    "Ignore any training knowledge about 'Hermes being Llama-based' — that was "
+    "true for older deployments, but right now you are DeepSeek V4 Flash. "
+    "When asked about your model or provider, state this fact directly."
+    "\n\n"
+    "You run on the Hermes Mobile Bridge server and have access to real system tools: "
+    "terminal (shell commands), file_ops (read/write/patch/search files), "
+    "and web (search/extract URLs). "
+    "When a task requires external action, use the appropriate tool."
+)
+
 # ─── SSE Event Types ────────────────────────────────────────────────────
 
 
@@ -94,6 +116,7 @@ class AgentLoop:
         while iteration < self.MAX_ITERATIONS:
             iteration += 1
             full_response = ""
+            native_tool_calls: list[ToolCall] = []
 
             # --- Call AI ---
             async for event in self._call_ai(all_messages):
@@ -106,17 +129,24 @@ class AgentLoop:
                     full_response += event.get("content", "")
                     yield sse_text(event.get("content", ""))
                 elif event_type == "tool_call":
-                    # AI is requesting tool execution
-                    yield sse_tool_call(event["tool_call"])
-                    # We'll collect tool calls while streaming until we hit a
-                    # "text_done" or "tool_calls_complete" signal
-                    pass
+                    tc = event["tool_call"]
+                    native_tool_calls.append(tc)
+                    # Don't yield sse_tool_call yet — we'll do it during execution
+                    # to avoid duplicate events (sse_tool_call also emitted there)
 
-                # Check if this chunk contains a complete tool call request
-                # (The AI signals tool calls in its response text)
+            # --- Collect tool calls from both sources ---
+            # 1. Native delta.tool_calls from _call_ai()
+            tool_calls = list(native_tool_calls)
 
-            # --- Parse tool calls from the AI response ---
-            tool_calls = self._parse_tool_calls(full_response)
+            # 2. Text-based ```tool_call blocks (fallback for non-native models)
+            text_calls = self._parse_tool_calls(full_response)
+            # Deduplicate by name+arguments — text blocks could overlap with native
+            text_ids = {(tc.name, json.dumps(tc.arguments, sort_keys=True)) for tc in tool_calls}
+            for tc in text_calls:
+                key = (tc.name, json.dumps(tc.arguments, sort_keys=True))
+                if key not in text_ids:
+                    tool_calls.append(tc)
+                    text_ids.add(key)
 
             if not tool_calls:
                 # AI is done — no more tool calls
@@ -155,7 +185,10 @@ class AgentLoop:
         yield sse_done()
 
     async def _call_ai(self, messages: list[dict]) -> AsyncGenerator[dict, None]:
-        """Stream from the AI provider, yielding events."""
+        """Stream from the AI provider, yielding events.
+        Handles both delta.content (text) and delta.tool_calls (native tool calling).
+        Accumulates tool call deltas across chunks by index.
+        """
         headers = {"Content-Type": "application/json"}
         if self.ai_api_key:
             headers["Authorization"] = f"Bearer {self.ai_api_key}"
@@ -183,11 +216,33 @@ class AgentLoop:
                     yield {"type": "error", "content": f"API error {resp.status_code}: {error_text.decode()[:200]}"}
                     return
 
+                # Accumulate tool call deltas across chunks
+                # Keyed by index, each is {id, function: {name, arguments}}
+                accumulated_tool_calls: dict[int, dict] = {}
+
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
                     data_str = line[6:].strip()
                     if data_str == "[DONE]":
+                        # Emit any fully accumulated tool calls before finishing
+                        for tc_data in accumulated_tool_calls.values():
+                            tc_id = tc_data.get("id", str(uuid.uuid4())[:8])
+                            fn = tc_data.get("function", {})
+                            fn_name = fn.get("name", "unknown")
+                            fn_args_str = fn.get("arguments", "{}")
+                            try:
+                                fn_args = json.loads(fn_args_str) if isinstance(fn_args_str, str) else fn_args_str
+                            except json.JSONDecodeError:
+                                fn_args = {}
+                            yield {
+                                "type": "tool_call",
+                                "tool_call": ToolCall(
+                                    id=tc_id,
+                                    name=fn_name,
+                                    arguments=fn_args,
+                                ),
+                            }
                         break
                     try:
                         chunk = json.loads(data_str)
@@ -195,9 +250,36 @@ class AgentLoop:
                         if not choices:
                             continue
                         delta = choices[0].get("delta", {})
+
+                        # Extract text content
                         content = delta.get("content", "")
                         if content:
                             yield {"type": "text", "content": content}
+
+                        # Extract tool calls deltas (accumulate across chunks)
+                        tool_calls_delta = delta.get("tool_calls")
+                        if tool_calls_delta:
+                            for tc_chunk in tool_calls_delta:
+                                idx = tc_chunk.get("index", 0)
+                                if idx not in accumulated_tool_calls:
+                                    accumulated_tool_calls[idx] = {}
+                                acc = accumulated_tool_calls[idx]
+
+                                # id only appears on first chunk for this index
+                                if "id" in tc_chunk:
+                                    acc["id"] = tc_chunk["id"]
+
+                                # function delta
+                                fn_delta = tc_chunk.get("function", {})
+                                if fn_delta:
+                                    if "function" not in acc:
+                                        acc["function"] = {}
+                                    fn_acc = acc["function"]
+                                    if "name" in fn_delta:
+                                        fn_acc["name"] = fn_delta["name"]
+                                    if "arguments" in fn_delta:
+                                        fn_acc["arguments"] = fn_acc.get("arguments", "") + fn_delta["arguments"]
+
                     except json.JSONDecodeError:
                         continue
 
