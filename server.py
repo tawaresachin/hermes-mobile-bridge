@@ -317,66 +317,45 @@ async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
 
 @app.post("/api/chat/stream")
 async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
-    """Streaming chat endpoint (SSE)."""
+    """Streaming chat endpoint with full agent tool execution."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
 
     _save_user_message(session_id, body.query)
     _upsert_session(session_id, body.query)
 
+    # Load conversation history
     openai_messages = _build_openai_messages(session_id)
 
+    # Use the agent loop for full tool execution
+    from agent_loop import AgentLoop
+
+    loop = AgentLoop(
+        ai_base_url=AI_BASE_URL,
+        ai_api_key=AI_API_KEY,
+        ai_model=AI_MODEL,
+    )
+
     async def event_generator() -> AsyncGenerator[str, None]:
-        full_response = ""
+        full_assistant_response = ""
         try:
-            headers = {"Content-Type": "application/json"}
-            if AI_API_KEY:
-                headers["Authorization"] = f"Bearer {AI_API_KEY}"
-
-            payload = {
-                "model": AI_MODEL,
-                "messages": openai_messages,
-                "stream": True,
-            }
-
-            async with _http_client.stream(
-                "POST",
-                f"{AI_BASE_URL}/chat/completions",
-                json=payload,
-                headers=headers,
-            ) as resp:
-                if resp.status_code != 200:
-                    error_text = await resp.aread()
-                    yield f"data: {json.dumps({'content': f'⚠️ API error {resp.status_code}: {error_text.decode()[:200]}'})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
+            async for event in loop.run(openai_messages, body.query):
+                yield event
+                # Collect text for saving
+                if '"type":"text"' in event and '"content":"' in event:
                     try:
-                        chunk = json.loads(data_str)
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            full_response += content
-                            yield f"data: {json.dumps({'content': content})}\n\n"
-                    except json.JSONDecodeError:
-                        continue
-
+                        data = json.loads(event[6:])  # Strip "data: "
+                        if data.get("type") == "text":
+                            full_assistant_response += data.get("content", "")
+                    except (json.JSONDecodeError, IndexError):
+                        pass
         except Exception as e:
-            yield f"data: {json.dumps({'content': f'⚠️ Connection error: {e}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'content': f'⚠ Agent error: {e}'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
-        # Save assistant response
-        if full_response:
-            _save_assistant_message(session_id, full_response)
-
-        yield "data: [DONE]\n\n"
+        # Save assistant response to history
+        if full_assistant_response:
+            _save_assistant_message(session_id, full_assistant_response)
 
     return StreamingResponse(
         event_generator(),
