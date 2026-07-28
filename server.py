@@ -370,39 +370,53 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
 
 @app.post("/api/chat")
 async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
-    """Non-streaming chat endpoint (for simple clients)."""
+    """Non-streaming chat endpoint with full agent tool execution."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
 
     _save_user_message(session_id, body.query)
     _upsert_session(session_id, body.query)
 
+    # Use agent loop but just collect the final response
+    from agent_loop import AgentLoop
+    from tools import registry
+
+    loop = AgentLoop(
+        ai_base_url=AI_BASE_URL,
+        ai_api_key=AI_API_KEY,
+        ai_model=AI_MODEL,
+    )
+
     openai_messages = _build_openai_messages(session_id)
+    final_response = ""
+    error_msg = None
 
     try:
-        headers = {"Content-Type": "application/json"}
-        if AI_API_KEY:
-            headers["Authorization"] = f"Bearer {AI_API_KEY}"
-
-        payload = {
-            "model": AI_MODEL,
-            "messages": openai_messages,
-            "stream": False,
-        }
-
-        resp = await _http_client.post(
-            f"{AI_BASE_URL}/chat/completions",
-            json=payload,
-            headers=headers,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            _save_assistant_message(session_id, content)
-            return {"response": content, "session_id": session_id}
-        else:
-            return {"response": f"⚠️ API error: {resp.status_code}", "session_id": session_id}
+        async for event in loop.run(openai_messages, body.query):
+            if '"type":"text"' in event and '"content":"' in event:
+                try:
+                    data = json.loads(event[6:])
+                    if data.get("type") == "text":
+                        final_response += data.get("content", "")
+                except (json.JSONDecodeError, IndexError):
+                    pass
+            if '"type":"error"' in event:
+                try:
+                    data = json.loads(event[6:])
+                    error_msg = data.get("content", "Agent error")
+                except json.JSONDecodeError:
+                    pass
     except Exception as e:
-        return {"response": f"⚠️ Error: {e}", "session_id": session_id}
+        error_msg = str(e)
+
+    if error_msg:
+        return {"response": f"⚠️ {error_msg}", "session_id": session_id}
+
+    if final_response:
+        _save_assistant_message(session_id, final_response)
+    else:
+        final_response = f"⚠️ No response generated"
+
+    return {"response": final_response, "session_id": session_id}
 
 
 # ─── Discovery / Registry Integration ──────────────────────────────
