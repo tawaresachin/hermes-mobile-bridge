@@ -426,6 +426,77 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
         return {"response": f"⚠️ Error: {e}", "session_id": session_id}
 
 
+# ─── Discovery / Registry Integration ──────────────────────────────
+
+# Discovery is optional — only runs when HERMES_REGISTRY_URL is set
+
+
+async def start_discovery():
+    """Initialize identity and start heartbeat loop."""
+    registry_url = os.getenv("HERMES_REGISTRY_URL")
+    if not registry_url:
+        print("   No HERMES_REGISTRY_URL set — skipping registry registration")
+        return
+
+    from discovery import BridgeIdentity, RegistryClient
+
+    identity = BridgeIdentity().load_or_create()
+
+    if not identity.is_loaded():
+        # First run — prompt for email
+        email = os.getenv("HERMES_EMAIL", "")
+        if not email:
+            print("⚠ HERMES_EMAIL not set. Set it to register with the discovery registry.")
+            return
+        identity.create_new(email)
+        print(f"   Registered new identity: {identity.device_id[:16]}...")
+
+    client = RegistryClient(identity)
+    await client.register()
+
+    # Detect tunnel URL
+    tunnel_url = os.getenv("HERMES_TUNNEL_URL", "")
+    if not tunnel_url:
+        # Try to detect from cloudflared log file
+        url_file = STORE_PATH / ".current_tunnel_url"
+        if url_file.exists():
+            content = url_file.read_text()
+            import re
+            match = re.search(r'https://[a-z0-9.-]+\.trycloudflare\.com', content)
+            if match:
+                tunnel_url = match.group(0)
+
+    if tunnel_url:
+        await client.heartbeat(
+            tunnel_url=tunnel_url,
+            platform=__import__("sys").platform,
+            version="2.0.0",
+        )
+        print(f"   Tunnel URL: {tunnel_url}")
+    else:
+        print("⚠ No tunnel URL detected — set HERMES_TUNNEL_URL or start cloudflared")
+
+    # Start periodic heartbeat
+    import asyncio
+
+    async def heartbeat_loop():
+        while True:
+            await asyncio.sleep(180)  # every 3 minutes
+            try:
+                url = os.getenv("HERMES_TUNNEL_URL", tunnel_url or "")
+                if url:
+                    await client.heartbeat(url, platform=__import__("sys").platform)
+            except Exception:
+                pass
+
+    asyncio.create_task(heartbeat_loop())
+
+
+@app.on_event("startup")
+async def on_startup():
+    await start_discovery()
+
+
 # ─── Main ────────────────────────────────────────────────────────────────
 
 
