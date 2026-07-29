@@ -149,7 +149,7 @@ def _upsert_session(session_id: str, query: str) -> None:
 
 def _build_openai_messages(session_id: str) -> list[dict]:
     """Build the conversation history array for the OpenAI-compatible API.
-    Handles attachments by converting image URLs to OpenAI's image_url format.
+    Handles attachments by appending the URL to the text content.
     Does NOT include a system prompt — AgentLoop adds its own."""
     msgs = load_messages(session_id)
     result = []
@@ -159,17 +159,12 @@ def _build_openai_messages(session_id: str) -> list[dict]:
         attach_type = m.get("attachment_type", "")
 
         if attach_url:
-            # Build multi-part content with attachment
-            content_parts = [{"type": "text", "text": content or "See attached file"}]
-            if attach_type and "image" in attach_type:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": attach_url}
-                })
-            else:
-                # Non-image files: append URL to text
-                content_parts[0]["text"] += f"\n\nAttachment: {attach_url}"
-            result.append({"role": m["role"], "content": content_parts})
+            # Append attachment URL to text content (model is text-only)
+            label = "Image" if attach_type and "image" in attach_type else "File"
+            result.append({
+                "role": m["role"],
+                "content": f"{content}\n\n[{label} attached: {attach_url}]"
+            })
         else:
             result.append({"role": m["role"], "content": content})
     return result
