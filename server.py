@@ -8,6 +8,7 @@ New in v2: User authentication with JWT + refresh tokens.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes
@@ -143,11 +144,11 @@ def _upsert_session(session_id: str, query: str) -> None:
 
 
 def _build_openai_messages(session_id: str) -> list[dict]:
-    """Build the conversation history array for the OpenAI-compatible API."""
+    """Build the conversation history array for the OpenAI-compatible API.
+    Does NOT include a system prompt — AgentLoop adds its own."""
     msgs = load_messages(session_id)
     return [
-        {"role": "system", "content": "You are Hermes, a helpful AI assistant. Be concise and accurate."},
-        *[{"role": m["role"], "content": m["content"]} for m in msgs[-20:]],
+        {"role": m["role"], "content": m["content"]} for m in msgs[-20:]
     ]
 
 
@@ -336,12 +337,13 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     openai_messages = _build_openai_messages(session_id)
 
     # Use the agent loop for full tool execution
-    from agent_loop import AgentLoop
+    from agent_loop import AgentLoop, DEFAULT_SYSTEM_PROMPT
 
     loop = AgentLoop(
         ai_base_url=AI_BASE_URL,
         ai_api_key=AI_API_KEY,
         ai_model=AI_MODEL,
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
     )
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -350,21 +352,31 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             async for event in loop.run(openai_messages, body.query):
                 yield event
                 # Collect text for saving
-                if '"type":"text"' in event and '"content":"' in event:
+                if '"type": "text"' in event and '"content": "' in event:
                     try:
                         data = json.loads(event[6:])  # Strip "data: "
                         if data.get("type") == "text":
                             full_assistant_response += data.get("content", "")
                     except (json.JSONDecodeError, IndexError):
                         pass
+        except asyncio.CancelledError:
+            # Client disconnected — save what we have
+            logger.warning(f"Stream cancelled for session {session_id}, saving partial response")
+            if full_assistant_response:
+                _save_assistant_message(session_id, full_assistant_response)
+            return
         except Exception as e:
+            logger.error(f"Stream error for session {session_id}: {e}")
             yield f"data: {json.dumps({'type': 'error', 'content': f'⚠ Agent error: {e}'})}\n\n"
             yield "data: [DONE]\n\n"
             return
 
         # Save assistant response to history
         if full_assistant_response:
+            logger.info(f"Saving assistant response for session {session_id} ({len(full_assistant_response)} chars)")
             _save_assistant_message(session_id, full_assistant_response)
+        else:
+            logger.warning(f"Empty full_assistant_response for session {session_id}")
 
     return StreamingResponse(
         event_generator(),
@@ -385,13 +397,13 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     _upsert_session(session_id, body.query)
 
     # Use agent loop but just collect the final response
-    from agent_loop import AgentLoop
-    from tools import registry
+    from agent_loop import AgentLoop, DEFAULT_SYSTEM_PROMPT
 
     loop = AgentLoop(
         ai_base_url=AI_BASE_URL,
         ai_api_key=AI_API_KEY,
         ai_model=AI_MODEL,
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
     )
 
     openai_messages = _build_openai_messages(session_id)

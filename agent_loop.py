@@ -108,9 +108,8 @@ class AgentLoop:
         Run the agent loop for a new user query.
         Yields SSE-formatted events (text, tool_call, tool_result, [DONE]).
         """
-        # Add user message
+        # Add user message (server already saved it to history — don't duplicate)
         all_messages = list(messages)
-        all_messages.append({"role": "user", "content": query})
 
         iteration = 0
         while iteration < self.MAX_ITERATIONS:
