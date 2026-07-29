@@ -108,10 +108,14 @@ def save_messages(session_id: str, msgs: list[dict]) -> None:
 # ─── Shared helpers ─────────────────────────────────────────────────────
 
 
-def _save_user_message(session_id: str, query: str) -> None:
+def _save_user_message(session_id: str, query: str, attachment_url: str = "", attachment_type: str = "") -> None:
     """Append the user's query to the message history and persist."""
     msgs = load_messages(session_id)
-    msgs.append({"role": "user", "content": query, "timestamp": time.time()})
+    entry = {"role": "user", "content": query, "timestamp": time.time()}
+    if attachment_url:
+        entry["attachment_url"] = attachment_url
+        entry["attachment_type"] = attachment_type
+    msgs.append(entry)
     save_messages(session_id, msgs)
 
 
@@ -145,11 +149,30 @@ def _upsert_session(session_id: str, query: str) -> None:
 
 def _build_openai_messages(session_id: str) -> list[dict]:
     """Build the conversation history array for the OpenAI-compatible API.
+    Handles attachments by converting image URLs to OpenAI's image_url format.
     Does NOT include a system prompt — AgentLoop adds its own."""
     msgs = load_messages(session_id)
-    return [
-        {"role": m["role"], "content": m["content"]} for m in msgs[-20:]
-    ]
+    result = []
+    for m in msgs[-20:]:
+        content = m["content"]
+        attach_url = m.get("attachment_url", "")
+        attach_type = m.get("attachment_type", "")
+
+        if attach_url:
+            # Build multi-part content with attachment
+            content_parts = [{"type": "text", "text": content or "See attached file"}]
+            if attach_type and "image" in attach_type:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": attach_url}
+                })
+            else:
+                # Non-image files: append URL to text
+                content_parts[0]["text"] += f"\n\nAttachment: {attach_url}"
+            result.append({"role": m["role"], "content": content_parts})
+        else:
+            result.append({"role": m["role"], "content": content})
+    return result
 
 
 # ─── Models ──────────────────────────────────────────────────────────────
@@ -159,6 +182,8 @@ class ChatRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
     stream: bool = True
+    attachment_url: Optional[str] = None
+    attachment_type: Optional[str] = None
 
 
 class RegisterRequest(BaseModel):
@@ -337,7 +362,7 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             content={"detail": "Query cannot be empty"},
         )
 
-    _save_user_message(session_id, body.query)
+    _save_user_message(session_id, body.query, body.attachment_url or "", body.attachment_type or "")
     _upsert_session(session_id, body.query)
 
     # Load conversation history
@@ -358,7 +383,9 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     async def event_generator() -> AsyncGenerator[str, None]:
         full_assistant_response = ""
         try:
-            async for event in loop.run(openai_messages, body.query, session_id=session_id):
+            async for event in loop.run(openai_messages, body.query, session_id=session_id,
+                                         attachment_url=body.attachment_url or "",
+                                         attachment_type=body.attachment_type or ""):
                 yield event
                 # Collect text for saving
                 if '"type": "text"' in event and '"content": "' in event:

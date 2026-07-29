@@ -105,6 +105,8 @@ class AgentLoop:
         messages: list[dict],
         query: str,
         session_id: str = "",
+        attachment_url: str = "",
+        attachment_type: str = "",
     ) -> AsyncGenerator[str, None]:
         """
         Run the agent loop for a new user query.
