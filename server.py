@@ -403,15 +403,20 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     """Streaming chat endpoint with full agent tool execution."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
 
-    # Reject empty queries
-    if not body.query or not body.query.strip():
+    # Reject empty queries (but allow if attachment is present)
+    has_attachment = bool(body.attachment_url and body.attachment_url.strip())
+    if (not body.query or not body.query.strip()) and not has_attachment:
         return JSONResponse(
             status_code=400,
             content={"detail": "Query cannot be empty"},
         )
 
-    _save_user_message(session_id, body.query, body.attachment_url or "", body.attachment_type or "")
-    _upsert_session(session_id, body.query)
+    query = body.query.strip() if body.query else ""
+    if not query and has_attachment:
+        query = "[User attached a file without text]"
+
+    _save_user_message(session_id, query, body.attachment_url or "", body.attachment_type or "")
+    _upsert_session(session_id, query)
 
     # Load conversation history
     openai_messages = _build_openai_messages(session_id)
@@ -431,7 +436,7 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     async def event_generator() -> AsyncGenerator[str, None]:
         full_assistant_response = ""
         try:
-            async for event in loop.run(openai_messages, body.query, session_id=session_id,
+            async for event in loop.run(openai_messages, query, session_id=session_id,
                                          attachment_url=body.attachment_url or "",
                                          attachment_type=body.attachment_type or ""):
                 yield event
