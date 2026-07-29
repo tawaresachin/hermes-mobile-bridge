@@ -147,9 +147,60 @@ def _upsert_session(session_id: str, query: str) -> None:
     save_sessions(sessions)
 
 
+def _read_attachment_content(attach_url: str, attach_type: str) -> str:
+    """Try to read uploaded file content from the local filesystem.
+    Returns a string snippet to embed in the message, or empty string if unreadable."""
+    if not attach_url or not attach_url.startswith("/uploads/"):
+        return ""
+
+    try:
+        # Parse /uploads/{session_id}/{filename}
+        parts = attach_url.split("/")
+        if len(parts) < 4:
+            return ""
+        sess = parts[2]
+        fname = "/".join(parts[3:])
+        fpath = UPLOADS_DIR / sess / fname
+        if not fpath.exists() or not fpath.is_file():
+            return ""
+
+        # Read first 8KB of content
+        raw = fpath.read_bytes()[:8192]
+
+        # Try to decode as text
+        text = None
+        for enc in ("utf-8", "latin-1"):
+            try:
+                decoded = raw.decode(enc)
+                # Verify it's readable text (not binary pretending to be latin-1)
+                printable = sum(1 for c in decoded if c.isprintable() or c in "\n\r\t")
+                ratio = printable / max(len(decoded), 1)
+                if ratio > 0.85:
+                    text = decoded
+                    break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+
+        if text is None:
+            # Binary file — report type and size
+            size = fpath.stat().st_size
+            mime_hint = attach_type or "unknown"
+            return f"[{mime_hint} file, {size} bytes — content not readable as text]"
+
+        # Truncate to reasonable length
+        if len(text) > 6000:
+            text = text[:6000] + "\n… [truncated]"
+
+        return f"\n\n--- Attached file: {fname} ---\n{text}\n--- End of attached file ---"
+
+    except Exception as e:
+        logger.warning("Failed to read attachment %s: %s", attach_url, e)
+        return ""
+
+
 def _build_openai_messages(session_id: str) -> list[dict]:
     """Build the conversation history array for the OpenAI-compatible API.
-    Handles attachments by appending the URL to the text content.
+    Reads uploaded file content from local storage and embeds it as text.
     Does NOT include a system prompt — AgentLoop adds its own."""
     msgs = load_messages(session_id)
     result = []
@@ -159,12 +210,14 @@ def _build_openai_messages(session_id: str) -> list[dict]:
         attach_type = m.get("attachment_type", "")
 
         if attach_url:
-            # Append attachment URL to text content (model is text-only)
-            label = "Image" if attach_type and "image" in attach_type else "File"
-            result.append({
-                "role": m["role"],
-                "content": f"{content}\n\n[{label} attached: {attach_url}]"
-            })
+            file_snippet = _read_attachment_content(attach_url, attach_type)
+            enhanced = content
+            if file_snippet:
+                enhanced += file_snippet
+            else:
+                label = "Image" if attach_type and "image" in attach_type else "File"
+                enhanced += f"\n\n[{label} attached: {attach_url}]"
+            result.append({"role": m["role"], "content": enhanced})
         else:
             result.append({"role": m["role"], "content": content})
     return result
