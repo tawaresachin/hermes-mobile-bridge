@@ -12,6 +12,7 @@ from typing import AsyncGenerator, Optional
 import httpx
 
 from tools import ToolCall, ToolResult, ToolRegistry, registry
+from hermes_features import handle_command, build_system_prompt, COMMANDS
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
@@ -103,12 +104,23 @@ class AgentLoop:
         self,
         messages: list[dict],
         query: str,
+        session_id: str = "",
     ) -> AsyncGenerator[str, None]:
         """
         Run the agent loop for a new user query.
         Yields SSE-formatted events (text, tool_call, tool_result, [DONE]).
         """
-        # Add user message (server already saved it to history — don't duplicate)
+        # Check for slash commands first
+        handled, cmd_response = handle_command(query, session_id)
+        if handled and cmd_response:
+            yield sse_text(cmd_response)
+            yield sse_done()
+            return
+
+        # Build enhanced system prompt with skills, commands, and rules
+        enhanced_prompt = build_system_prompt(self.system_prompt)
+
+        # Use messages from history — server already saved the query
         all_messages = list(messages)
 
         iteration = 0
@@ -118,7 +130,7 @@ class AgentLoop:
             native_tool_calls: list[ToolCall] = []
 
             # --- Call AI ---
-            async for event in self._call_ai(all_messages):
+            async for event in self._call_ai(all_messages, system_prompt=enhanced_prompt):
                 event_type = event.get("type", "")
                 if event_type == "error":
                     yield sse_text(event.get("content", "AI error"))
@@ -183,7 +195,7 @@ class AgentLoop:
         # AI finished without (more) tool calls — we're done
         yield sse_done()
 
-    async def _call_ai(self, messages: list[dict]) -> AsyncGenerator[dict, None]:
+    async def _call_ai(self, messages: list[dict], system_prompt: str | None = None) -> AsyncGenerator[dict, None]:
         """Stream from the AI provider, yielding events.
         Handles both delta.content (text) and delta.tool_calls (native tool calling).
         Accumulates tool call deltas across chunks by index.
@@ -192,10 +204,12 @@ class AgentLoop:
         if self.ai_api_key:
             headers["Authorization"] = f"Bearer {self.ai_api_key}"
 
+        sp = system_prompt or self.system_prompt
+
         payload = {
             "model": self.ai_model,
             "messages": [
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": sp},
                 *[m for m in messages if m.get("role") != "system"],
             ],
             "stream": True,

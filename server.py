@@ -338,6 +338,8 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
 
     # Use the agent loop for full tool execution
     from agent_loop import AgentLoop, DEFAULT_SYSTEM_PROMPT
+    from hermes_features import set_config
+    set_config(AI_MODEL, AI_BASE_URL)
 
     loop = AgentLoop(
         ai_base_url=AI_BASE_URL,
@@ -349,7 +351,7 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     async def event_generator() -> AsyncGenerator[str, None]:
         full_assistant_response = ""
         try:
-            async for event in loop.run(openai_messages, body.query):
+            async for event in loop.run(openai_messages, body.query, session_id=session_id):
                 yield event
                 # Collect text for saving
                 if '"type": "text"' in event and '"content": "' in event:
