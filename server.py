@@ -20,9 +20,9 @@ from typing import AsyncGenerator, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Request, Depends, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Depends, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 
@@ -329,6 +329,13 @@ async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
 async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     """Streaming chat endpoint with full agent tool execution."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
+
+    # Reject empty queries
+    if not body.query or not body.query.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Query cannot be empty"},
+        )
 
     _save_user_message(session_id, body.query)
     _upsert_session(session_id, body.query)

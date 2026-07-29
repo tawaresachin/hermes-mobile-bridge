@@ -111,6 +111,11 @@ class AgentLoop:
         Yields SSE-formatted events (text, tool_call, tool_result, [DONE]).
         """
         # Check for slash commands first
+        if not query or not query.strip():
+            # Empty query — nothing to process
+            yield sse_done()
+            return
+
         handled, cmd_response = handle_command(query, session_id)
         if handled and cmd_response:
             yield sse_text(cmd_response)

@@ -118,6 +118,9 @@ def handle_command(query: str, session_id: str) -> tuple[bool, str | None]:
     """Check if query is a slash command. Returns (handled, response_text).
     If handled=True, the caller should send response_text as the assistant reply.
     """
+    if not query or not query.strip():
+        return False, None
+
     cmd = query.strip().split()[0].lower()
 
     if cmd == "/help":
