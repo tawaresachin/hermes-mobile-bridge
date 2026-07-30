@@ -13,7 +13,11 @@ import json
 import logging
 import mimetypes
 import os
+import secrets
+import shutil
+import subprocess
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator, Optional
@@ -22,7 +26,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, Depends, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse, JSONResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 
@@ -43,15 +47,93 @@ from auth_handler import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hermes-bridge")
 
+# ─── Load .env if present ────────────────────────────────────────────────
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _key, _val = _line.split("=", 1)
+            _val = _val.strip("\"'")
+            if _key not in os.environ:
+                os.environ[_key] = _val
+            logger.info("Loaded .env: %s=%s...", _key, _val[:8] + "..." if len(_val) > 8 else _val)
+else:
+    logger.info("No .env file found at %s", _env_path)
+
 # ─── Config ──────────────────────────────────────────────────────────────
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "9119"))
 
-# AI provider (OpenAI-compatible)
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://opencode.ai/zen/v1")
-AI_API_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENCODE_ZEN_API_KEY", "")
-AI_MODEL = os.getenv("AI_MODEL", "deepseek-v4-flash-free")
+# AI provider (OpenAI-compatible) — Omnirouter default for auto-routing
+AI_BASE_URL = os.getenv("AI_BASE_URL", "http://localhost:20128/v1")
+AI_API_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "auto/best-coding")
+
+# Session-scoped model overrides (live switching, no restart needed)
+# Keyed by session_id, value is model name
+_session_model_overrides: dict[str, str] = {}
+# Maps model_id → base_url for provider-aware switching
+_model_base_url_map: dict[str, str] = {}
+_session_base_url_overrides: dict[str, str] = {}
+
+
+def _resolve_model(session_id: str) -> str:
+    """Get the effective model for a session: override if set, else default."""
+    return _session_model_overrides.get(session_id, AI_MODEL)
+
+
+def _resolve_base_url(session_id: str) -> str:
+    """Get the effective base URL for a session."""
+    return _session_base_url_overrides.get(session_id, AI_BASE_URL)
+
+
+def _handle_special_command(query: str, session_id: str) -> tuple[bool, str | None]:
+    """
+    Handle commands that need to run BEFORE the agent loop (model switching, etc.)
+    Returns (handled, response_text). If handled=True, the caller should return
+    the response immediately without creating an AgentLoop.
+    """
+    q = query.strip()
+    if not q:
+        return False, None
+
+    parts = q.split()
+    cmd = parts[0].lower()
+
+    # ─── Live model switch (/model <name> [--global]) ───
+    if cmd == "/model" and len(parts) >= 2 and parts[1] not in ("help", "?", "list"):
+        model_name = parts[1]
+        is_global = "--global" in parts or "-g" in parts
+
+        if is_global:
+            # Write to .env as new default (persistent)
+            env_path = Path(__file__).parent / ".env"
+            if env_path.exists():
+                content = env_path.read_text(encoding="utf-8")
+                if "AI_MODEL=" in content:
+                    lines = content.splitlines()
+                    content = "\n".join(
+                        f"AI_MODEL={model_name}" if l.startswith("AI_MODEL=") else l
+                        for l in lines
+                    )
+                else:
+                    content += f"\nAI_MODEL={model_name}"
+                env_path.write_text(content, encoding="utf-8")
+            # Also update the module-level default for immediate effect
+            import server as _srv_mod
+            _srv_mod.AI_MODEL = model_name
+            return True, f"✅ Model permanently switched to `{model_name}` (global)."
+        else:
+            # Session-scoped override (live, no restart)
+            _session_model_overrides[session_id] = model_name
+            # Also switch base URL if we know it for this model
+            if model_name in _model_base_url_map:
+                _session_base_url_overrides[session_id] = _model_base_url_map[model_name]
+            return True, f"✅ Model switched to `{model_name}` for this session."
+
+    return False, None
 
 # Optional static API key for backward compatibility
 # If set, accepts Authorization: Bearer <this_key> as fallback
@@ -182,9 +264,22 @@ def _read_attachment_content(attach_url: str, attach_type: str) -> str:
                 continue
 
         if text is None:
-            # Binary file — report type and size
+            # Binary file — try OCR if it's an image
             size = fpath.stat().st_size
             mime_hint = attach_type or "unknown"
+            
+            if attach_type and attach_type.startswith("image/"):
+                # Try OCR with tesseract (Marathi + English)
+                try:
+                    ocr_text = subprocess.run(
+                        ["tesseract", str(fpath), "stdout", "-l", "mar+eng", "--psm", "6"],
+                        capture_output=True, text=True, timeout=30
+                    ).stdout.strip()
+                    if ocr_text and len(ocr_text) > 10:
+                        return f"\n\n--- Attached image (OCR extracted): {fname} ---\n{ocr_text}\n--- End of OCR text ---"
+                except Exception:
+                    pass
+            
             return f"[{mime_hint} file, {size} bytes — content not readable as text]"
 
         # Truncate to reasonable length
@@ -272,6 +367,7 @@ async def verify_bearer(request: Request) -> dict:
     """
     FastAPI dependency: validate Authorization: Bearer ***
     Returns the decoded JWT payload (contains sub=user_id, email).
+    Also accepts the static HERMES_API_KEY as fallback.
     Raises 401 on failure.
     """
     auth = request.headers.get("Authorization", "")
@@ -279,17 +375,25 @@ async def verify_bearer(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
     token = auth[7:].strip()
+
+    # Try JWT first
     payload = decode_access_token(token, JWT_SECRET)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if payload:
+        # Verify user still exists
+        try:
+            user_id = int(payload["sub"])
+            user = auth_db.get_user_by_email(payload["email"])
+            if not user or user.id != user_id:
+                raise HTTPException(status_code=401, detail="User not found")
+        except (ValueError, KeyError):
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+        return payload
 
-    # Verify user still exists
-    user_id = int(payload["sub"])
-    user = auth_db.get_user_by_email(payload["email"])
-    if not user or user.id != user_id:
-        raise HTTPException(status_code=401, detail="User not found")
+    # Fallback: check static API key (backward compat)
+    if HERMES_API_KEY and token == HERMES_API_KEY:
+        return {"sub": "0", "email": "legacy@api-key", "type": "legacy"}
 
-    return payload
+    raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
 # Public endpoints that don't require auth
@@ -398,6 +502,117 @@ async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
     return {"status": "ok", "deleted": session_id}
 
 
+@app.get("/api/models")
+async def list_models(session_id: str = "", user: dict = Depends(verify_bearer)):
+    """List available models — only from providers we can actually query."""
+    from hermes_features import _list_available_models, AI_MODEL, AI_BASE_URL, _read_config_yaml
+    import urllib.request, urllib.error
+
+    seen = set()
+    models = []
+
+    # 1. Query current provider — if it's Omnirouter, tag as omnirouter
+    raw = _list_available_models()
+    is_omnirouter = "localhost:20128" in AI_BASE_URL or "127.0.0.1:20128" in AI_BASE_URL
+    provider_label = "omnirouter" if is_omnirouter else None
+    for m in raw:
+        mid = m.get("id", m) if isinstance(m, dict) else m
+        if mid and mid not in seen:
+            seen.add(mid)
+            prov = provider_label or (mid.split("/")[0] if "/" in mid else "unknown")
+            models.append({
+                "id": mid,
+                "name": mid.split("/")[-1] if "/" in mid else mid,
+                "isFree": False,
+                "isVision": any(k in mid.lower() for k in ("vl", "vision", "multimodal")),
+                "provider": prov,
+                "baseUrl": AI_BASE_URL,
+            })
+
+    # 2. Query OpenCode/Zen models (no auth needed)
+    try:
+        req = urllib.request.Request(
+            "https://opencode.ai/zen/v1/models",
+            headers={"User-Agent": "HermesMobileBridge/2.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            oc_data = json.loads(resp.read())
+        for m in oc_data.get("data", []):
+            mid = m.get("id", "")
+            if mid and mid not in seen:
+                seen.add(mid)
+                is_free = mid.endswith("-free")
+                models.append({
+                    "id": mid,
+                    "name": mid,
+                    "isFree": is_free,
+                    "isVision": any(k in mid.lower() for k in ("vl", "vision", "multimodal")),
+                    "provider": "opencode",
+                    "baseUrl": "https://opencode.ai/zen/v1",
+                })
+    except Exception as e:
+        logger.warning("OpenCode/Zen query failed: %s", e)
+
+    # 4. Try OpenRouter models if key is configured
+    or_key = os.environ.get("OPENROUTER_API_KEY")
+    if or_key:
+        try:
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {or_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                or_data = json.loads(resp.read())
+            for m in or_data.get("data", []):
+                mid = m.get("id", "")
+                if mid and mid not in seen:
+                    seen.add(mid)
+                    is_free = mid.endswith(":free") or mid.endswith("-free")
+                    models.append({
+                        "id": mid,
+                        "name": mid.split("/")[-1] if "/" in mid else mid,
+                        "isFree": is_free,
+                        "isVision": any(k in mid.lower() for k in ("vl", "vision", "multimodal")),
+                        "provider": "openrouter",
+                        "baseUrl": "https://openrouter.ai/api/v1",
+                    })
+        except Exception as e:
+            logger.warning("OpenRouter query failed: %s", e)
+
+    # 5. Custom providers from config.yaml
+    config = _read_config_yaml()
+    raw_cp = config.get("custom_providers", {})
+    cp_list = raw_cp if isinstance(raw_cp, list) else [raw_cp]
+    for cp in cp_list:
+        if not isinstance(cp, dict):
+            continue
+        cp_model = cp.get("model", "")
+        cp_name = cp.get("name", "custom")
+        if cp_model and cp_model not in seen:
+            seen.add(cp_model)
+            models.append({
+                "id": cp_model,
+                "name": cp_model.split("/")[-1] if "/" in cp_model else cp_model,
+                "isFree": False,
+                "isVision": False,
+                "provider": cp_name.lower().replace(" ", "-"),
+                "baseUrl": cp.get("base_url", ""),
+            })
+
+    # Build base URL map for provider-aware switching
+    for m in models:
+        if m.get("baseUrl"):
+            _model_base_url_map[m["id"]] = m["baseUrl"]
+
+    current = _session_model_overrides.get(session_id, AI_MODEL)
+    return {
+        "models": models,
+        "current": current,
+        "default": AI_MODEL,
+        "provider": AI_BASE_URL,
+    }
+
+
 @app.post("/api/chat/stream")
 async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     """Streaming chat endpoint with full agent tool execution."""
@@ -418,18 +633,34 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     _save_user_message(session_id, query, body.attachment_url or "", body.attachment_type or "")
     _upsert_session(session_id, query)
 
+    # ─── Pre-check for special commands (model switch, etc.) ───
+    handled, cmd_response = _handle_special_command(query, session_id)
+    if handled and cmd_response:
+        async def _cmd_generator():
+            yield f"data: {json.dumps({'type': 'text', 'content': cmd_response})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(
+            _cmd_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     # Load conversation history
     openai_messages = _build_openai_messages(session_id)
+
+    # Use session-scoped model override if available
+    effective_model = _resolve_model(session_id)
 
     # Use the agent loop for full tool execution
     from agent_loop import AgentLoop, DEFAULT_SYSTEM_PROMPT
     from hermes_features import set_config
-    set_config(AI_MODEL, AI_BASE_URL)
+    effective_base_url = _resolve_base_url(session_id)
+    set_config(effective_model, effective_base_url)
 
     loop = AgentLoop(
-        ai_base_url=AI_BASE_URL,
+        ai_base_url=effective_base_url,
         ai_api_key=AI_API_KEY,
-        ai_model=AI_MODEL,
+        ai_model=effective_model,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
     )
 
@@ -441,11 +672,12 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
                                          attachment_type=body.attachment_type or ""):
                 yield event
                 # Collect text for saving
-                if '"type": "text"' in event and '"content": "' in event:
+                if event.startswith('data: {'):
                     try:
-                        data = json.loads(event[6:])  # Strip "data: "
-                        if data.get("type") == "text":
-                            full_assistant_response += data.get("content", "")
+                        raw = event[6:].strip()
+                        data = json.loads(raw)
+                        if data.get('type') == 'text':
+                            full_assistant_response += data.get('content', '')
                     except (json.JSONDecodeError, IndexError):
                         pass
         except asyncio.CancelledError:
@@ -485,13 +717,24 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     _save_user_message(session_id, body.query)
     _upsert_session(session_id, body.query)
 
+    # ─── Pre-check for special commands (model switch, etc.) ───
+    handled, cmd_response = _handle_special_command(body.query, session_id)
+    if handled and cmd_response:
+        return {"response": cmd_response, "session_id": session_id}
+
+    # Use session-scoped model override if available
+    effective_model = _resolve_model(session_id)
+    effective_base_url = _resolve_base_url(session_id)
+
     # Use agent loop but just collect the final response
     from agent_loop import AgentLoop, DEFAULT_SYSTEM_PROMPT
+    from hermes_features import set_config as _set_config
+    _set_config(effective_model, effective_base_url)
 
     loop = AgentLoop(
-        ai_base_url=AI_BASE_URL,
+        ai_base_url=effective_base_url,
         ai_api_key=AI_API_KEY,
-        ai_model=AI_MODEL,
+        ai_model=effective_model,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
     )
 
@@ -501,18 +744,16 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
 
     try:
         async for event in loop.run(openai_messages, body.query):
-            if '"type":"text"' in event and '"content":"' in event:
+            # Try to parse every SSE data event (cover both text and error types)
+            if event.startswith('data: {'):
                 try:
-                    data = json.loads(event[6:])
-                    if data.get("type") == "text":
-                        final_response += data.get("content", "")
+                    raw = event[6:].strip()
+                    data = json.loads(raw)
+                    if data.get('type') == 'text':
+                        final_response += data.get('content', '')
+                    elif data.get('type') == 'error':
+                        error_msg = data.get('content', 'Agent error')
                 except (json.JSONDecodeError, IndexError):
-                    pass
-            if '"type":"error"' in event:
-                try:
-                    data = json.loads(event[6:])
-                    error_msg = data.get("content", "Agent error")
-                except json.JSONDecodeError:
                     pass
     except Exception as e:
         error_msg = str(e)
@@ -602,6 +843,23 @@ async def upload_file(
     }
 
 
+@app.get("/download/apk")
+async def download_apk():
+    """Download the latest Hermes Mobile APK."""
+    apk_path = STORE_PATH / "uploads" / "hermes-mobile.apk"
+    if not apk_path.exists():
+        raise HTTPException(status_code=404, detail="APK not found. Build it first with ./gradlew assembleDebug")
+    return FileResponse(
+        path=str(apk_path),
+        media_type="application/vnd.android.package-archive",
+        filename="hermes-mobile.apk",
+        headers={
+            "Content-Disposition": 'attachment; filename="hermes-mobile.apk"',
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
 # ─── Discovery / Registry Integration ──────────────────────────────
 
 # Discovery is optional — only runs when HERMES_REGISTRY_URL is set
@@ -677,6 +935,141 @@ async def on_startup():
 
 
 if __name__ == "__main__":
+    # ─── OmniRoute Auto Lifecycle Management ───
+    # Bridge auto-detects, starts (if needed), and configures OmniRoute
+    # so the user always gets free auto-routing models without manual setup.
+    from hermes_features import _read_config_yaml as _rcfg
+
+    def _ensure_omnirouter() -> tuple[str, str, str]:
+        """
+        Full OmniRoute lifecycle: install → start → configure.
+        Returns (base_url, api_key, model_name).
+        """
+        or_url = "http://localhost:20128/v1"
+        or_key = ""
+        or_model = "auto/best-coding"
+        or_bin = None
+        installed_this_session = False
+
+        # ─── 1. Install if missing ───
+        try:
+            import shutil
+            or_bin = shutil.which("omniroute")
+        except Exception:
+            or_bin = None
+
+        if not or_bin:
+            logger.info("OmniRoute not found — installing via npm...")
+            try:
+                subprocess.run(
+                    ["npm", "install", "-g", "omniroute"],
+                    capture_output=True, timeout=120,
+                )
+                # Re-check after install
+                try:
+                    or_bin = shutil.which("omniroute")
+                except Exception:
+                    or_bin = None
+                if or_bin:
+                    installed_this_session = True
+                    logger.info("OmniRoute installed successfully: %s", or_bin)
+                else:
+                    logger.warning("OmniRoute install completed but binary not found")
+            except Exception as e:
+                logger.warning("OmniRoute install failed: %s — continuing with defaults", e)
+        else:
+            logger.info("OmniRoute already installed: %s", or_bin)
+
+        # ─── 2. Ensure server is running ───
+        running = False
+        if or_bin:
+            try:
+                req = urllib.request.Request(f"{or_url}/models", headers={"User-Agent": "HermesBridge/2.0"})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    if resp.status == 200:
+                        running = True
+                        logger.info("OmniRoute server already running on %s", or_url)
+            except Exception:
+                pass
+
+            if not running:
+                logger.info("Starting OmniRoute server...")
+                try:
+                    proc = subprocess.Popen(
+                        [or_bin, "serve"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    logger.info("OmniRoute started (PID %d)", proc.pid)
+                    # Wait up to 20s for readiness
+                    for attempt in range(20):
+                        time.sleep(1)
+                        try:
+                            req = urllib.request.Request(f"{or_url}/models", headers={"User-Agent": "HermesBridge/2.0"})
+                            with urllib.request.urlopen(req, timeout=2) as resp:
+                                if resp.status == 200:
+                                    running = True
+                                    logger.info("OmniRoute ready after %ds", attempt + 1)
+                                    break
+                        except Exception:
+                            continue
+                    if not running:
+                        logger.warning("OmniRoute did not become ready within 20s")
+                except Exception as e:
+                    logger.warning("Failed to start OmniRoute: %s", e)
+
+        # ─── 3. Setup API key ───
+        # Read from env first (set by OmniRoute's .env or Hermes config)
+        or_key = os.environ.get("HERMES_CUSTOM_LOCALHOST_20128_API_KEY", "")
+        if not or_key:
+            or_key = os.environ.get("OMNIROUTE_API_KEY", "")
+        if not or_key and running:
+            # No key found — generate one and export to env
+            import secrets
+            or_key = f"sk-{secrets.token_hex(16)}"
+            os.environ["HERMES_CUSTOM_LOCALHOST_20128_API_KEY"] = or_key
+            logger.info("Generated new OmniRoute API key")
+        if or_key:
+            logger.info("OmniRoute API key: %s...%s", or_key[:8], or_key[-4:])
+
+        # ─── 4. Apply config.yaml override (if present) ───
+        try:
+            _cfg = _rcfg()
+            _cp_list = _cfg.get("custom_providers", {})
+            if isinstance(_cp_list, dict):
+                _cp_list = [_cp_list]
+            for _cp in _cp_list:
+                if isinstance(_cp, dict) and "omnirouter" in (_cp.get("name", "") or "").lower():
+                    _cu = _cp.get("base_url", "").rstrip("/")
+                    if _cu:
+                        or_url = _cu
+                    _ke = _cp.get("key_env", "")
+                    if _ke and os.environ.get(_ke):
+                        or_key = os.environ.get(_ke, "")
+                    _ms = _cp.get("models", [])
+                    if _ms:
+                        or_model = _ms[0] if isinstance(_ms, list) else _ms
+                    break
+        except Exception:
+            pass
+
+        return or_url, or_key, or_model
+
+    # Run OmniRoute setup
+    _or_url, _or_key, _or_model = _ensure_omnirouter()
+    if _or_url:
+        AI_BASE_URL = _or_url
+    if _or_key:
+        AI_API_KEY = _or_key
+    if _or_model:
+        AI_MODEL = _or_model
+
+    logger.info("AI provider: %s @ %s (key: %s)", AI_MODEL, AI_BASE_URL, "set" if AI_API_KEY else "none")
+
+    # Initialize command handler with current config
+    from hermes_features import set_config
+    set_config(AI_MODEL, AI_BASE_URL)
     print(f"🤖 Hermes Mobile Bridge v2 starting on http://{HOST}:{PORT}")
     print(f"   AI: {AI_MODEL} @ {AI_BASE_URL}")
     print(f"   Store: {STORE_PATH}")
