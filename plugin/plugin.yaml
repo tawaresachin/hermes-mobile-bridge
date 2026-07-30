@@ -1,0 +1,23 @@
+name: mobile-bridge
+version: "2.1.0"
+description: |
+  Hermes Mobile Bridge — REST/SSE server that powers the Hermes Mobile Android app.
+  Provides chat, model switching, file upload, and tool execution via HTTP.
+  Auto-integrates with OmniRoute for token-free auto-routing.
+
+author: Hermes Mobile
+license: MIT
+homepage: https://github.com/tawaresachin/hermes-mobile-bridge
+
+# Hermes plugin hooks this plugin uses
+hooks: []
+
+# Required Hermes minimum version
+hermes_min_version: "0.18.0"
+
+# CLI sub-commands this plugin registers
+cli_commands:
+  - mobile-serve
+
+# Tools this plugin provides to the agent
+tools: []
