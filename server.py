@@ -13,9 +13,11 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 import uuid
@@ -397,7 +399,7 @@ async def verify_bearer(request: Request) -> dict:
 
 
 # Public endpoints that don't require auth
-PUBLIC_PATHS = {"/health", "/diag", "/auth/register", "/auth/login", "/auth/refresh"}
+PUBLIC_PATHS = {"/health", "/diag", "/auth/register", "/auth/login", "/auth/refresh", "/setup/qr", "/setup/connect"}
 
 
 @app.middleware("http")
@@ -860,7 +862,78 @@ async def download_apk():
     )
 
 
-# ─── Discovery / Registry Integration ──────────────────────────────
+# ─── QR Code Setup Endpoints ─────────────────────────────────────────
+
+@app.get("/setup/qr")
+async def setup_qr():
+    """Return a QR code PNG that the mobile app scans to auto-configure."""
+    import io
+    try:
+        import qrcode
+        from qrcode.image.pil import PilImage
+    except ImportError:
+        raise HTTPException(status_code=501, detail="qrcode[pil] not installed — run: pip install qrcode[pil]")
+
+    # Auto-detect best IP
+    host_ip = _detect_host_ip()
+    setup_url = f"hermes://connect?host={host_ip}&port={PORT}&key={HERMES_API_KEY}"
+    
+    img = qrcode.make(setup_url, image_factory=PilImage)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+@app.get("/setup/connect")
+async def setup_connect():
+    """Return connection JSON for the app to auto-configure."""
+    host_ip = _detect_host_ip()
+    return {
+        "host": host_ip,
+        "port": PORT,
+        "url": f"http://{host_ip}:{PORT}",
+        "key": HERMES_API_KEY,
+        "model": AI_MODEL,
+        "provider": AI_BASE_URL,
+        "version": "2.1.0",
+    }
+
+
+def _detect_host_ip() -> str:
+    """Detect the best IP for the app to connect to."""
+    # 0. Env override (set by plugin's Tailscale auto-setup)
+    ts_ip = os.environ.get("HERMES_TAILSCALE_IP", "")
+    if ts_ip and ts_ip.startswith("100."):
+        return ts_ip
+
+    # 1. Tailscale IP (preferred for remote access)
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=5,
+        )
+        ip = result.stdout.strip()
+        if ip and ip.startswith("100."):
+            return ip
+    except Exception:
+        pass
+
+    # 2. LAN IP (WiFi)
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.1)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip:
+            return ip
+    except Exception:
+        pass
+
+    # 3. Fallback
+    return "127.0.0.1"
 
 # Discovery is optional — only runs when HERMES_REGISTRY_URL is set
 
@@ -895,7 +968,6 @@ async def start_discovery():
         url_file = STORE_PATH / ".current_tunnel_url"
         if url_file.exists():
             content = url_file.read_text()
-            import re
             match = re.search(r'https://[a-z0-9.-]+\.trycloudflare\.com', content)
             if match:
                 tunnel_url = match.group(0)
@@ -903,7 +975,7 @@ async def start_discovery():
     if tunnel_url:
         await client.heartbeat(
             tunnel_url=tunnel_url,
-            platform=__import__("sys").platform,
+            platform=sys.platform,
             version="2.0.0",
         )
         print(f"   Tunnel URL: {tunnel_url}")
@@ -911,15 +983,13 @@ async def start_discovery():
         print("⚠ No tunnel URL detected — set HERMES_TUNNEL_URL or start cloudflared")
 
     # Start periodic heartbeat
-    import asyncio
-
     async def heartbeat_loop():
         while True:
-            await asyncio.sleep(180)  # every 3 minutes
+            await asyncio.sleep(180)
             try:
                 url = os.getenv("HERMES_TUNNEL_URL", tunnel_url or "")
                 if url:
-                    await client.heartbeat(url, platform=__import__("sys").platform)
+                    await client.heartbeat(url, platform=sys.platform)
             except Exception:
                 pass
 
@@ -949,11 +1019,9 @@ if __name__ == "__main__":
         or_key = ""
         or_model = "auto/best-coding"
         or_bin = None
-        installed_this_session = False
 
         # ─── 1. Install if missing ───
         try:
-            import shutil
             or_bin = shutil.which("omniroute")
         except Exception:
             or_bin = None
@@ -965,13 +1033,11 @@ if __name__ == "__main__":
                     ["npm", "install", "-g", "omniroute"],
                     capture_output=True, timeout=120,
                 )
-                # Re-check after install
                 try:
                     or_bin = shutil.which("omniroute")
                 except Exception:
                     or_bin = None
                 if or_bin:
-                    installed_this_session = True
                     logger.info("OmniRoute installed successfully: %s", or_bin)
                 else:
                     logger.warning("OmniRoute install completed but binary not found")
@@ -1025,8 +1091,6 @@ if __name__ == "__main__":
         if not or_key:
             or_key = os.environ.get("OMNIROUTE_API_KEY", "")
         if not or_key and running:
-            # No key found — generate one and export to env
-            import secrets
             or_key = f"sk-{secrets.token_hex(16)}"
             os.environ["HERMES_CUSTOM_LOCALHOST_20128_API_KEY"] = or_key
             logger.info("Generated new OmniRoute API key")
@@ -1073,4 +1137,10 @@ if __name__ == "__main__":
     print(f"🤖 Hermes Mobile Bridge v2 starting on http://{HOST}:{PORT}")
     print(f"   AI: {AI_MODEL} @ {AI_BASE_URL}")
     print(f"   Store: {STORE_PATH}")
+    try:
+        _setup_ip = _detect_host_ip()
+        print(f"📱 App setup: http://{_setup_ip}:{PORT}/setup/connect")
+        print(f"📱 Scan QR:   http://{_setup_ip}:{PORT}/setup/qr")
+    except Exception:
+        pass
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
