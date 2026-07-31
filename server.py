@@ -340,10 +340,15 @@ def _save_user_message(session_id: str, query: str, attachment_url: str = "", at
     save_messages(session_id, msgs)
 
 
-def _save_assistant_message(session_id: str, content: str) -> None:
-    """Append the assistant response to the message history and persist."""
+def _save_assistant_message(session_id: str, content: str, reasoning_content: str = "") -> None:
+    """Append the assistant response to the message history and persist.
+    reasoning_content (DeepSeek thinking mode) is stored so it can be
+    echoed back to the API on the next turn — DeepSeek requires it."""
     msgs = load_messages(session_id)
-    msgs.append({"role": "assistant", "content": content, "timestamp": time.time()})
+    entry = {"role": "assistant", "content": content, "timestamp": time.time()}
+    if reasoning_content:
+        entry["reasoning_content"] = reasoning_content
+    msgs.append(entry)
     save_messages(session_id, msgs)
 
 
@@ -439,6 +444,8 @@ def _read_attachment_content(attach_url: str, attach_type: str) -> str:
 def _build_openai_messages(session_id: str) -> list[dict]:
     """Build the conversation history array for the OpenAI-compatible API.
     Reads uploaded file content from local storage and embeds it as text.
+    Echoes back reasoning_content (DeepSeek thinking mode) — DeepSeek
+    requires it on follow-up turns or it returns 400.
     Does NOT include a system prompt — AgentLoop adds its own."""
     msgs = load_messages(session_id)
     result = []
@@ -455,9 +462,16 @@ def _build_openai_messages(session_id: str) -> list[dict]:
             else:
                 label = "Image" if attach_type and "image" in attach_type else "File"
                 enhanced += f"\n\n[{label} attached: {attach_url}]"
-            result.append({"role": m["role"], "content": enhanced})
+            entry: dict = {"role": m["role"], "content": enhanced}
+            if m.get("reasoning_content"):
+                entry["reasoning_content"] = m["reasoning_content"]
+            result.append(entry)
         else:
-            result.append({"role": m["role"], "content": content})
+            entry = {"role": m["role"], "content": content}
+            # Echo back DeepSeek's reasoning_content from prior assistant turns
+            if m.get("reasoning_content"):
+                entry["reasoning_content"] = m["reasoning_content"]
+            result.append(entry)
     return result
 
 
@@ -880,19 +894,22 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     async def event_generator() -> AsyncGenerator[str, None]:
         # List + join: O(n) — string += in a loop is O(n²) for long streams
         response_chunks: list[str] = []
+        reasoning_chunks: list[str] = []
         full_assistant_response = ""
         try:
             async for event in loop.run(openai_messages, query, session_id=session_id,
                                          attachment_url=body.attachment_url or "",
                                          attachment_type=body.attachment_type or ""):
                 yield event
-                # Collect text for saving
+                # Collect text + reasoning for saving
                 if event.startswith('data: {'):
                     try:
                         raw = event[6:].strip()
                         data = json.loads(raw)
                         if data.get('type') == 'text':
                             response_chunks.append(data.get('content', ''))
+                        elif data.get('type') == 'reasoning':
+                            reasoning_chunks.append(data.get('content', ''))
                     except (json.JSONDecodeError, IndexError):
                         pass
             full_assistant_response = "".join(response_chunks)
@@ -900,7 +917,10 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             # Client disconnected — save what we have
             logger.warning(f"Stream cancelled for session {session_id}, saving partial response")
             if full_assistant_response:
-                _save_assistant_message(session_id, full_assistant_response)
+                _save_assistant_message(
+                    session_id, full_assistant_response,
+                    reasoning_content="".join(reasoning_chunks),
+                )
             return
         except Exception as e:
             logger.error(f"Stream error for session {session_id}: {e}")
@@ -913,7 +933,10 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
         # Save assistant response to history
         if full_assistant_response:
             logger.info(f"Saving assistant response for session {session_id} ({len(full_assistant_response)} chars)")
-            _save_assistant_message(session_id, full_assistant_response)
+            _save_assistant_message(
+                session_id, full_assistant_response,
+                reasoning_content="".join(reasoning_chunks),
+            )
         else:
             logger.warning(f"Empty full_assistant_response for session {session_id}")
 
@@ -959,6 +982,7 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     openai_messages = _build_openai_messages(session_id)
     # List + join: O(n) — string += in a loop is O(n²) for long responses
     response_chunks: list[str] = []
+    reasoning_chunks: list[str] = []
     final_response = ""
     error_msg = None
 
@@ -971,6 +995,8 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
                     data = json.loads(raw)
                     if data.get('type') == 'text':
                         response_chunks.append(data.get('content', ''))
+                    elif data.get('type') == 'reasoning':
+                        reasoning_chunks.append(data.get('content', ''))
                     elif data.get('type') == 'error':
                         error_msg = data.get('content', 'Agent error')
                 except (json.JSONDecodeError, IndexError):
@@ -984,7 +1010,10 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
         return {"response": f"⚠️ {error_msg}", "session_id": session_id}
 
     if final_response:
-        _save_assistant_message(session_id, final_response)
+        _save_assistant_message(
+            session_id, final_response,
+            reasoning_content="".join(reasoning_chunks),
+        )
     else:
         final_response = f"⚠️ No response generated"
 

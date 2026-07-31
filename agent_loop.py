@@ -36,6 +36,12 @@ def sse_text(content: str) -> str:
     return f"data: {json.dumps({'type': 'text', 'content': content})}\n\n"
 
 
+def sse_reasoning(content: str) -> str:
+    """Stream DeepSeek's reasoning_content so the caller can persist it —
+    DeepSeek requires it echoed back on the next turn."""
+    return f"data: {json.dumps({'type': 'reasoning', 'content': content})}\n\n"
+
+
 def sse_tool_call(tc: ToolCall) -> str:
     return f"data: {json.dumps({
         'type': 'tool_call',
@@ -127,6 +133,7 @@ class AgentLoop:
         while iteration < self.MAX_ITERATIONS:
             iteration += 1
             full_response = ""
+            full_reasoning = ""
             native_tool_calls: list[ToolCall] = []
 
             # --- Call AI ---
@@ -139,6 +146,10 @@ class AgentLoop:
                 elif event_type == "text":
                     full_response += event.get("content", "")
                     yield sse_text(event.get("content", ""))
+                elif event_type == "reasoning":
+                    full_reasoning += event.get("content", "")
+                    # Persist reasoning too — DeepSeek needs it echoed back
+                    yield sse_reasoning(event.get("content", ""))
                 elif event_type == "tool_call":
                     tc = event["tool_call"]
                     native_tool_calls.append(tc)
@@ -166,10 +177,13 @@ class AgentLoop:
             # Persist any assistant text spoken alongside the tool calls —
             # otherwise the next AI iteration loses it (context loss).
             if full_response.strip():
-                all_messages.append({
+                msg_entry: dict = {
                     "role": "assistant",
                     "content": full_response,
-                })
+                }
+                if full_reasoning:
+                    msg_entry["reasoning_content"] = full_reasoning
+                all_messages.append(msg_entry)
 
             # --- Execute each tool ---
             result_texts = []
@@ -182,7 +196,7 @@ class AgentLoop:
                 result_texts.append(f"Tool '{tc.name}' returned: {result.output or result.error}")
 
                 # Add assistant tool call to conversation history
-                all_messages.append({
+                tc_entry: dict = {
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [{
@@ -190,7 +204,10 @@ class AgentLoop:
                         "type": "function",
                         "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
                     }],
-                })
+                }
+                if full_reasoning:
+                    tc_entry["reasoning_content"] = full_reasoning
+                all_messages.append(tc_entry)
                 # Add tool result to conversation history
                 all_messages.append({
                     "role": "tool",
@@ -276,6 +293,14 @@ class AgentLoop:
                         content = delta.get("content", "")
                         if content:
                             yield {"type": "text", "content": content}
+
+                        # Extract reasoning content (DeepSeek thinking mode).
+                        # Must be echoed back to the API on the next turn,
+                        # so it is emitted as its own event for the caller
+                        # to persist alongside the message.
+                        reasoning = delta.get("reasoning_content", "")
+                        if reasoning:
+                            yield {"type": "reasoning", "content": reasoning}
 
                         # Extract tool calls deltas (accumulate across chunks)
                         tool_calls_delta = delta.get("tool_calls")
@@ -378,6 +403,9 @@ async def simple_chat_stream(
                         content = delta.get("content", "")
                         if content:
                             yield f"data: {json.dumps({'type': 'text', 'content': content})}\n\n"
+                        reasoning = delta.get("reasoning_content", "")
+                        if reasoning:
+                            yield f"data: {json.dumps({'type': 'reasoning', 'content': reasoning})}\n\n"
                     except json.JSONDecodeError:
                         continue
 
