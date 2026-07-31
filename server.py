@@ -166,20 +166,10 @@ def _runtime_key_for_base_url(base_url: str) -> str:
             if key:
                 return key
 
-    # 2. Environment scan — match host segments against env var names
-    host = bl.split("://")[-1].split("/")[0].split(":")[0]  # e.g. opencode.ai
-    segments = [s for s in host.split(".") if s.isalpha()]
-    if segments:
-        for name, val in sorted(os.environ.items()):
-            if not val:
-                continue
-            if not (name.endswith("_API_KEY") or name.endswith("_TOKEN") or name.endswith("_KEY")):
-                continue
-            name_l = name.lower()
-            if any(seg in name_l for seg in segments):
-                return val
-
-    # 3. auxiliary.<task>.api_key prefix match (e.g. vision → HF Router)
+    # 2. auxiliary.<task>.api_key prefix match (e.g. vision → HF Router).
+    #    Declared config wins over env heuristics — checked BEFORE the env
+    #    scan so a generic host segment (e.g. "router" in openrouter) can't
+    #    shadow a provider that's explicitly configured.
     for task, task_cfg in config.get("auxiliary", {}).items():
         if not isinstance(task_cfg, dict):
             continue
@@ -188,6 +178,24 @@ def _runtime_key_for_base_url(base_url: str) -> str:
             key = _interp(task_cfg.get("api_key", ""))
             if key:
                 return key
+
+    # 3. Environment scan — match host segments against env var names.
+    host = bl.split("://")[-1].split("/")[0].split(":")[0]  # e.g. opencode.ai
+    segments = [s for s in host.split(".") if s.isalpha() and len(s) >= 4]
+    if segments:
+        best_var, best_len = "", 0
+        for name, val in sorted(os.environ.items()):
+            if not val:
+                continue
+            if not (name.endswith("_API_KEY") or name.endswith("_TOKEN") or name.endswith("_KEY")):
+                continue
+            name_l = name.lower()
+            # Score = longest host segment found in this env var name
+            score = max((len(s) for s in segments if s in name_l), default=0)
+            if score > best_len:
+                best_var, best_len = name, score
+        if best_var:
+            return os.environ[best_var]
 
     return ""
 
@@ -660,13 +668,13 @@ async def list_models(session_id: str = "", user: dict = Depends(verify_bearer))
     """List available models — only from providers we can actually query.
 
     Runs the (blocking) provider queries on a thread executor so the event
-    loop never freezes, and caches the result for 120s so the app's model
-    picker opens instantly on repeat visits.
+    loop never freezes, and caches the result for 30 minutes so the app's
+    model picker opens instantly (model lists rarely change).
     """
     import time as _time
     global _models_cache_ts
-    # TTL cache: fresh results for 120s, then refetch
-    cache_ttl = 120
+    # TTL cache: fresh results for 30 min, then refetch in the background
+    cache_ttl = 1800
     now = _time.time()
     if now - _models_cache_ts < cache_ttl:
         return _models_cache
@@ -681,9 +689,76 @@ async def list_models(session_id: str = "", user: dict = Depends(verify_bearer))
 
 
 def _fetch_models_sync(session_id: str) -> dict:
-    """Blocking model fetch — runs in a worker thread, NOT the event loop."""
+    """Blocking model fetch — runs in a worker thread, NOT the event loop.
+    External provider queries run in PARALLEL (threads) so a slow provider
+    can't stall the others."""
     from hermes_features import _list_available_models, AI_MODEL, AI_BASE_URL, _read_config_yaml
     import urllib.request, urllib.error
+    import concurrent.futures
+
+    def _fetch_opencode() -> list[dict]:
+        """Query OpenCode/Zen models (no auth needed)."""
+        out = []
+        try:
+            req = urllib.request.Request(
+                "https://opencode.ai/zen/v1/models",
+                headers={"User-Agent": "HermesMobileBridge/2.0"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                oc_data = json.loads(resp.read())
+            for m in oc_data.get("data", []):
+                mid = m.get("id", "")
+                if mid:
+                    out.append({
+                        "id": mid,
+                        "name": mid,
+                        "isFree": mid.endswith("-free"),
+                        "isVision": any(k in mid.lower() for k in ("vl", "vision", "multimodal")),
+                        "provider": "opencode",
+                        "baseUrl": "https://opencode.ai/zen/v1",
+                    })
+        except Exception as e:
+            logger.warning("OpenCode/Zen query failed: %s", e)
+        return out
+
+    def _fetch_openrouter() -> list[dict]:
+        """Query OpenRouter models if a key is configured."""
+        out = []
+        or_key = os.environ.get("OPENROUTER_API_KEY")
+        if not or_key:
+            return out
+        try:
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {or_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                or_data = json.loads(resp.read())
+            for m in or_data.get("data", []):
+                mid = m.get("id", "")
+                if mid:
+                    out.append({
+                        "id": mid,
+                        "name": mid.split("/")[-1] if "/" in mid else mid,
+                        "isFree": mid.endswith(":free") or mid.endswith("-free"),
+                        "isVision": any(k in mid.lower() for k in ("vl", "vision", "multimodal")),
+                        "provider": "openrouter",
+                        "baseUrl": "https://openrouter.ai/api/v1",
+                    })
+        except Exception as e:
+            logger.warning("OpenRouter query failed: %s", e)
+        return out
+
+    # Fire the two external queries in parallel
+    ext_results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(_fetch_opencode)
+        f2 = pool.submit(_fetch_openrouter)
+        for fut in (f1, f2):
+            try:
+                ext_results.extend(fut.result())
+            except Exception as e:
+                logger.warning("Parallel model fetch failed: %s", e)
 
     seen = set()
     models = []
@@ -706,55 +781,12 @@ def _fetch_models_sync(session_id: str) -> dict:
                 "baseUrl": AI_BASE_URL,
             })
 
-    # 2. Query OpenCode/Zen models (no auth needed)
-    try:
-        req = urllib.request.Request(
-            "https://opencode.ai/zen/v1/models",
-            headers={"User-Agent": "HermesMobileBridge/2.0"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            oc_data = json.loads(resp.read())
-        for m in oc_data.get("data", []):
-            mid = m.get("id", "")
-            if mid and mid not in seen:
-                seen.add(mid)
-                is_free = mid.endswith("-free")
-                models.append({
-                    "id": mid,
-                    "name": mid,
-                    "isFree": is_free,
-                    "isVision": any(k in mid.lower() for k in ("vl", "vision", "multimodal")),
-                    "provider": "opencode",
-                    "baseUrl": "https://opencode.ai/zen/v1",
-                })
-    except Exception as e:
-        logger.warning("OpenCode/Zen query failed: %s", e)
-
-    # 4. Try OpenRouter models if key is configured
-    or_key = os.environ.get("OPENROUTER_API_KEY")
-    if or_key:
-        try:
-            req = urllib.request.Request(
-                "https://openrouter.ai/api/v1/models",
-                headers={"Authorization": f"Bearer {or_key}"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                or_data = json.loads(resp.read())
-            for m in or_data.get("data", []):
-                mid = m.get("id", "")
-                if mid and mid not in seen:
-                    seen.add(mid)
-                    is_free = mid.endswith(":free") or mid.endswith("-free")
-                    models.append({
-                        "id": mid,
-                        "name": mid.split("/")[-1] if "/" in mid else mid,
-                        "isFree": is_free,
-                        "isVision": any(k in mid.lower() for k in ("vl", "vision", "multimodal")),
-                        "provider": "openrouter",
-                        "baseUrl": "https://openrouter.ai/api/v1",
-                    })
-        except Exception as e:
-            logger.warning("OpenRouter query failed: %s", e)
+    # 2. External providers (already fetched in parallel)
+    for m in ext_results:
+        mid = m.get("id", "")
+        if mid and mid not in seen:
+            seen.add(mid)
+            models.append(m)
 
     # 5. Custom providers from config.yaml
     config = _read_config_yaml()
