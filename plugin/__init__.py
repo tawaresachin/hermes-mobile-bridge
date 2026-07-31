@@ -52,17 +52,18 @@ def _start_server(port: int, host: str, omniroute: bool) -> None:
         print("   Clone it: git clone https://github.com/tawaresachin/hermes-mobile-bridge.git")
         return
 
-    env = os.environ.copy()
-    env["AI_BASE_URL"] = env.get("AI_BASE_URL", "http://localhost:20128/v1")
-    env["AI_MODEL"] = env.get("AI_MODEL", "auto/best-coding")
-    env["HOST"] = host
-    env["PORT"] = str(port)
-
     print(f"🤖 Hermes Mobile Bridge starting on http://{host}:{port}")
 
     if omniroute:
         _ensure_omnirouter()
     ts_ip = _ensure_tailscale()
+
+    # Build env AFTER lifecycle setup so generated keys propagate to the subprocess
+    env = os.environ.copy()
+    env["AI_BASE_URL"] = env.get("AI_BASE_URL", "http://localhost:20128/v1")
+    env["AI_MODEL"] = env.get("AI_MODEL", "auto/best-coding")
+    env["HOST"] = host
+    env["PORT"] = str(port)
 
     if ts_ip:
         print(f"   🖧 Tailscale: {ts_ip}")
