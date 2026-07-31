@@ -435,6 +435,17 @@ async def auth_middleware(request: Request, call_next):
     return Response(status_code=401, content='{"detail":"Invalid or expired token"}', media_type="application/json")
 
 
+def _is_authorized(request: Request) -> bool:
+    """Check a request carries valid auth: JWT, the bridge API key, or a session token."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    token = auth[7:].strip()
+    if decode_access_token(token, JWT_SECRET):
+        return True
+    return bool(HERMES_API_KEY and token == HERMES_API_KEY)
+
+
 @app.post("/auth/register")
 async def auth_register(body: RegisterRequest):
     """Register a new user. Returns access + refresh tokens."""
@@ -880,9 +891,10 @@ SETUP_TOKEN = os.getenv("SETUP_TOKEN") or secrets.token_urlsafe(12)
 
 
 @app.get("/setup/qr")
-async def setup_qr(token: str = ""):
+async def setup_qr(request: Request, token: str = ""):
     """Return a QR code PNG that the mobile app scans to auto-configure."""
-    if token != SETUP_TOKEN:
+    # Accept: ?token=SETUP_TOKEN (QR pairing) OR valid JWT / bridge key (app session)
+    if not (token == SETUP_TOKEN or _is_authorized(request)):
         raise HTTPException(status_code=401, detail="Invalid setup token")
     import io
     try:
@@ -911,9 +923,10 @@ async def setup_qr(token: str = ""):
 
 
 @app.get("/setup/connect")
-async def setup_connect(token: str = ""):
+async def setup_connect(request: Request, token: str = ""):
     """Return connection JSON for the app to auto-configure."""
-    if token != SETUP_TOKEN:
+    # Accept: ?token=SETUP_TOKEN (QR pairing) OR valid JWT / bridge key (app session)
+    if not (token == SETUP_TOKEN or _is_authorized(request)):
         raise HTTPException(status_code=401, detail="Invalid setup token")
     ts_ip = _detect_host_ip()
     if ts_ip and ts_ip.startswith("100."):
