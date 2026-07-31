@@ -44,6 +44,13 @@ def _read_config_yaml() -> dict:
     config_path = HERMES_HOME / "config.yaml"
     if not config_path.exists():
         return {}
+    # Prefer PyYAML if available — the hand-rolled parser can't handle lists
+    try:
+        import yaml
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
     text = config_path.read_text(encoding="utf-8")
     # Simple nested key parser — handles basic YAML
     result = {}
@@ -95,6 +102,20 @@ def _get_hf_token() -> str:
     if hf_file.exists():
         return hf_file.read_text().strip()
     return ""
+
+
+def _get_provider_key() -> str:
+    """Get the API key for the currently configured AI provider.
+
+    Order: server's AI_API_KEY → OmniRoute key env → HF token.
+    """
+    key = os.environ.get("AI_API_KEY", "") or os.environ.get("HERMES_API_KEY", "")
+    if key and key != "hermes123":  # skip the static bridge key — it's not a provider key
+        return key
+    or_key = os.environ.get("HERMES_CUSTOM_LOCALHOST_20128_API_KEY", "")
+    if or_key:
+        return or_key
+    return _get_hf_token()
 
 
 def _get_supermemory_key() -> str:
@@ -257,21 +278,18 @@ def _memory_forget(text: str) -> str:
 
 
 def _list_available_models() -> list[str]:
-    """List available models from the current provider (HF Router)."""
-    # Determine which provider to query
+    """List available models from the current provider."""
     base_url = AI_BASE_URL.rstrip("/")
-    token = _get_hf_token()
+    # Use the configured provider API key, falling back to HF token for HF Router
+    token = _get_provider_key()
 
-    if "huggingface" in base_url and token:
-        models_url = f"{base_url}/models"
-        req = urllib.request.Request(
-            models_url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "User-Agent": "HermesMobileBridge/2.0",
-            },
-        )
+    if not token:
+        # Try unauthenticated (OmniRoute / OpenCode Zen need no auth)
         try:
+            req = urllib.request.Request(
+                f"{base_url}/models",
+                headers={"User-Agent": "HermesMobileBridge/2.0"},
+            )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read())
             models_list = data.get("data", data) if isinstance(data, dict) else data
@@ -280,15 +298,15 @@ def _list_available_models() -> list[str]:
                 for m in models_list
             ]
         except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to list models: %s", e)
+            logger.warning("Failed to list models (no auth): %s", e)
             return []
 
-    # Fallback: try generic /v1/models endpoint
+    # Authenticated request with the provider's key
     try:
         req = urllib.request.Request(
             f"{base_url}/models",
             headers={
-                "Authorization": f"Bearer {_get_hf_token()}",
+                "Authorization": f"Bearer {token}",
                 "User-Agent": "HermesMobileBridge/2.0",
             },
         )
@@ -300,7 +318,7 @@ def _list_available_models() -> list[str]:
             for m in models_list
         ]
     except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
-        logger.warning("Failed to list models from %s: %s", base_url, e)
+        logger.warning("Failed to list models: %s", e)
         return []
 
 

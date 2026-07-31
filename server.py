@@ -106,8 +106,9 @@ def _handle_special_command(query: str, session_id: str) -> tuple[bool, str | No
 
     # ─── Live model switch (/model <name> [--global]) ───
     if cmd == "/model" and len(parts) >= 2 and parts[1] not in ("help", "?", "list"):
-        model_name = parts[1]
         is_global = "--global" in parts or "-g" in parts
+        # Pick the first non-flag token as the model name (flags can appear anywhere)
+        model_name = next((p for p in parts[1:] if p not in ("--global", "-g")), "")
 
         if is_global:
             # Write to .env as new default (persistent)
@@ -245,11 +246,15 @@ def _read_attachment_content(attach_url: str, attach_type: str) -> str:
         sess = parts[2]
         fname = "/".join(parts[3:])
         fpath = UPLOADS_DIR / sess / fname
-        if not fpath.exists() or not fpath.is_file():
+        # Path-traversal guard: resolved path MUST stay inside the uploads dir
+        resolved = fpath.resolve()
+        if not str(resolved).startswith(str(UPLOADS_DIR.resolve())) or ".." in parts[2:]:
+            return ""
+        if not resolved.exists() or not resolved.is_file():
             return ""
 
         # Read first 8KB of content
-        raw = fpath.read_bytes()[:8192]
+        raw = resolved.read_bytes()[:8192]
 
         # Try to decode as text
         text = None
@@ -274,7 +279,7 @@ def _read_attachment_content(attach_url: str, attach_type: str) -> str:
                 # Try OCR with tesseract (Marathi + English)
                 try:
                     ocr_text = subprocess.run(
-                        ["tesseract", str(fpath), "stdout", "-l", "mar+eng", "--psm", "6"],
+                        ["tesseract", str(resolved), "stdout", "-l", "mar+eng", "--psm", "6"],
                         capture_output=True, text=True, timeout=30
                     ).stdout.strip()
                     if ocr_text and len(ocr_text) > 10:
@@ -800,6 +805,10 @@ async def upload_file(
     # Determine session_id from query param, or use user-specific default
     session_id = request.query_params.get("session_id", payload.get("sub", "default"))
 
+    # Path-traversal guard: session_id must be a plain identifier (no separators)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+
     # Ensure the session subdirectory exists
     session_upload_dir = UPLOADS_DIR / session_id
     session_upload_dir.mkdir(parents=True, exist_ok=True)
@@ -811,12 +820,15 @@ async def upload_file(
         safe_filename = "untitled"
 
     # Resolve full path, avoid overwrite by appending a suffix if needed
-    dest_path = session_upload_dir / safe_filename
+    dest_path = (session_upload_dir / safe_filename).resolve()
+    # Belt-and-braces: resolved path must stay inside the session upload dir
+    if not str(dest_path).startswith(str(UPLOADS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid filename")
     if dest_path.exists():
         stem, ext = os.path.splitext(safe_filename)
         counter = 1
         while dest_path.exists():
-            dest_path = session_upload_dir / f"{stem}_{counter}{ext}"
+            dest_path = (session_upload_dir / f"{stem}_{counter}{ext}").resolve()
             counter += 1
 
     # Save the file
@@ -888,7 +900,8 @@ async def setup_qr(token: str = ""):
         if tunnel_url:
             setup_url = f"hermes://connect?url={tunnel_url}&key={HERMES_API_KEY}&setup={SETUP_TOKEN}"
         else:
-            setup_url = f"hermes://connect?host={ts_ip}&port={PORT}&key={HERMES_API_KEY}&setup={SETUP_TOKEN}"
+            host_ip = ts_ip or "127.0.0.1"
+            setup_url = f"hermes://connect?host={host_ip}&port={PORT}&key={HERMES_API_KEY}&setup={SETUP_TOKEN}"
 
     img = qrcode.make(setup_url, image_factory=PilImage)
     buf = io.BytesIO()
