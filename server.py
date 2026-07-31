@@ -874,10 +874,17 @@ async def setup_qr():
     except ImportError:
         raise HTTPException(status_code=501, detail="qrcode[pil] not installed — run: pip install qrcode[pil]")
 
-    # Auto-detect best IP
-    host_ip = _detect_host_ip()
-    setup_url = f"hermes://connect?host={host_ip}&port={PORT}&key={HERMES_API_KEY}"
-    
+    # Tailscale IP (primary) → tunnel URL (fallback) → LAN IP (last resort)
+    ts_ip = _detect_host_ip()
+    if ts_ip and ts_ip.startswith("100."):
+        setup_url = f"hermes://connect?host={ts_ip}&port={PORT}&key={HERMES_API_KEY}"
+    else:
+        tunnel_url = _detect_tunnel_url()
+        if tunnel_url:
+            setup_url = f"hermes://connect?url={tunnel_url}&key={HERMES_API_KEY}"
+        else:
+            setup_url = f"hermes://connect?host={ts_ip}&port={PORT}&key={HERMES_API_KEY}"
+
     img = qrcode.make(setup_url, image_factory=PilImage)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -888,6 +895,26 @@ async def setup_qr():
 @app.get("/setup/connect")
 async def setup_connect():
     """Return connection JSON for the app to auto-configure."""
+    ts_ip = _detect_host_ip()
+    if ts_ip and ts_ip.startswith("100."):
+        return {
+            "host": ts_ip,
+            "port": PORT,
+            "url": f"http://{ts_ip}:{PORT}",
+            "key": HERMES_API_KEY,
+            "model": AI_MODEL,
+            "provider": AI_BASE_URL,
+            "version": "2.2.1",
+        }
+    tunnel_url = _detect_tunnel_url()
+    if tunnel_url:
+        return {
+            "url": tunnel_url,
+            "key": HERMES_API_KEY,
+            "model": AI_MODEL,
+            "provider": AI_BASE_URL,
+            "version": "2.2.1",
+        }
     host_ip = _detect_host_ip()
     return {
         "host": host_ip,
@@ -896,8 +923,21 @@ async def setup_connect():
         "key": HERMES_API_KEY,
         "model": AI_MODEL,
         "provider": AI_BASE_URL,
-        "version": "2.1.0",
+        "version": "2.2.1",
     }
+
+
+def _detect_tunnel_url() -> str:
+    """Detect the active Cloudflare tunnel URL, if any."""
+    tunnel_url = os.getenv("HERMES_TUNNEL_URL", "")
+    if not tunnel_url:
+        url_file = STORE_PATH / ".current_tunnel_url"
+        if url_file.exists():
+            content = url_file.read_text()
+            match = re.search(r'https://[a-z0-9.-]+\.trycloudflare\.com', content)
+            if match:
+                tunnel_url = match.group(0)
+    return tunnel_url
 
 
 def _detect_host_ip() -> str:
@@ -907,7 +947,7 @@ def _detect_host_ip() -> str:
     if ts_ip and ts_ip.startswith("100."):
         return ts_ip
 
-    # 1. Tailscale IP (preferred for remote access)
+    # 1. Tailscale IP (primary — via tailscale0 interface or CLI)
     try:
         result = subprocess.run(
             ["tailscale", "ip", "-4"],
@@ -916,6 +956,19 @@ def _detect_host_ip() -> str:
         ip = result.stdout.strip()
         if ip and ip.startswith("100."):
             return ip
+    except Exception:
+        pass
+
+    # 1b. Detect Tailscale IP from network interfaces (Android app mode)
+    try:
+        result = subprocess.run(
+            ["ip", "addr"], capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if "100." in line and "inet " in line:
+                match = re.search(r"inet (100\.\d+\.\d+\.\d+)", line)
+                if match:
+                    return match.group(1)
     except Exception:
         pass
 
