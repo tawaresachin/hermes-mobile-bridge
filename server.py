@@ -79,6 +79,10 @@ _session_model_overrides: dict[str, str] = {}
 # Maps model_id → base_url for provider-aware switching
 _model_base_url_map: dict[str, str] = {}
 _session_base_url_overrides: dict[str, str] = {}
+# Maps model_id → API key for the model's provider (provider-aware auth).
+# Populated by list_models() from env keys / config.yaml custom providers.
+_model_api_key_map: dict[str, str] = {}
+_session_api_key_overrides: dict[str, str] = {}
 
 
 def _resolve_model(session_id: str) -> str:
@@ -89,6 +93,103 @@ def _resolve_model(session_id: str) -> str:
 def _resolve_base_url(session_id: str) -> str:
     """Get the effective base URL for a session."""
     return _session_base_url_overrides.get(session_id, AI_BASE_URL)
+
+
+def _resolve_api_key(session_id: str) -> str:
+    """Get the effective API key for a session.
+
+    Provider-aware: if the session switched to a model from another provider
+    (OpenCode Zen, OpenRouter, HF Router, custom), return THAT provider's key.
+    Falls back to the default AI_API_KEY (OmniRoute) when no override exists.
+    """
+    # 1. Explicit per-session override (set on model switch)
+    key = _session_api_key_overrides.get(session_id, "")
+    if key:
+        return key
+    # 2. Look up the session's current model in the provider map
+    model = _resolve_model(session_id)
+    key = _model_api_key_map.get(model, "")
+    if key:
+        return key
+    # 3. Default (OmniRoute / main provider)
+    return AI_API_KEY
+
+
+# Bounded-session helper: caps an override dict at MAX_SESSION_OVERRIDES
+# entries (oldest evicted) so memory can't grow without limit.
+MAX_SESSION_OVERRIDES = 200
+
+
+def _bounded_override(d: dict, key: str) -> None:
+    if len(d) >= MAX_SESSION_OVERRIDES:
+        # Evict the oldest inserted key (dicts preserve insertion order)
+        try:
+            d.pop(next(iter(d)))
+        except (StopIteration, KeyError):
+            pass
+
+
+def _runtime_key_for_base_url(base_url: str) -> str:
+    """Auto-resolve the API key for a provider base URL at runtime.
+
+    ZERO hardcoded values — every source is discovered live:
+      1. config.yaml custom_providers whose base_url prefix-matches,
+         with ${ENV_VAR} interpolation in api_key values.
+      2. Environment scan: any *_API_KEY / *_TOKEN / *_KEY var whose name
+         contains a host segment of the base URL (e.g. OPENCODE_ZEN_API_KEY
+         matches opencode.ai, OPENROUTER_API_KEY matches openrouter.ai).
+      3. config.yaml auxiliary.<task>.api_key entries whose base_url
+         prefix-matches (e.g. auxiliary.vision → HF Router key).
+    Returns "" when nothing matches — callers fall back to AI_API_KEY.
+    """
+    import re as _re
+    bl = (base_url or "").lower().rstrip("/")
+    if not bl:
+        return ""
+
+    def _interp(v: str) -> str:
+        return _re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: os.environ.get(m.group(1), ""), v or "")
+
+    # Lazy import — hermes_features reads the config from the Hermes home dir
+    from hermes_features import _read_config_yaml
+    config = _read_config_yaml()
+
+    # 1. custom_providers prefix match (config-driven, env-interpolated)
+    raw_cp = config.get("custom_providers", {})
+    cp_list = raw_cp if isinstance(raw_cp, list) else [raw_cp]
+    for cp in cp_list:
+        if not isinstance(cp, dict):
+            continue
+        bu = (cp.get("base_url") or "").lower().rstrip("/")
+        if bu and bl.startswith(bu):
+            key = _interp(cp.get("api_key", ""))
+            if key:
+                return key
+
+    # 2. Environment scan — match host segments against env var names
+    host = bl.split("://")[-1].split("/")[0].split(":")[0]  # e.g. opencode.ai
+    segments = [s for s in host.split(".") if s.isalpha()]
+    if segments:
+        for name, val in sorted(os.environ.items()):
+            if not val:
+                continue
+            if not (name.endswith("_API_KEY") or name.endswith("_TOKEN") or name.endswith("_KEY")):
+                continue
+            name_l = name.lower()
+            if any(seg in name_l for seg in segments):
+                return val
+
+    # 3. auxiliary.<task>.api_key prefix match (e.g. vision → HF Router)
+    for task, task_cfg in config.get("auxiliary", {}).items():
+        if not isinstance(task_cfg, dict):
+            continue
+        bu = (task_cfg.get("base_url") or "").lower().rstrip("/")
+        if bu and bl.startswith(bu):
+            key = _interp(task_cfg.get("api_key", ""))
+            if key:
+                return key
+
+    return ""
 
 
 def _handle_special_command(query: str, session_id: str) -> tuple[bool, str | None]:
@@ -109,9 +210,18 @@ def _handle_special_command(query: str, session_id: str) -> tuple[bool, str | No
         is_global = "--global" in parts or "-g" in parts
         # Pick the first non-flag token as the model name (flags can appear anywhere)
         model_name = next((p for p in parts[1:] if p not in ("--global", "-g")), "")
+        if not model_name:
+            return False, None
+
+        # Bounded caches: keep only the most recent N sessions so the
+        # override dicts can't grow unbounded (memory hygiene).
+        _bounded_override(_session_model_overrides, session_id)
+        if not is_global:
+            _bounded_override(_session_base_url_overrides, session_id)
+            _bounded_override(_session_api_key_overrides, session_id)
 
         if is_global:
-            # Write to .env as new default (persistent)
+            # Write to .env as new default (persistent) — atomic: temp file + rename
             env_path = Path(__file__).parent / ".env"
             if env_path.exists():
                 content = env_path.read_text(encoding="utf-8")
@@ -123,17 +233,32 @@ def _handle_special_command(query: str, session_id: str) -> tuple[bool, str | No
                     )
                 else:
                     content += f"\nAI_MODEL={model_name}"
-                env_path.write_text(content, encoding="utf-8")
+                tmp_path = env_path.with_suffix(".env.tmp")
+                tmp_path.write_text(content, encoding="utf-8")
+                tmp_path.replace(env_path)  # atomic on POSIX
             # Also update the module-level default for immediate effect
             import server as _srv_mod
             _srv_mod.AI_MODEL = model_name
+            # Global switch → also update global base URL + API key defaults
+            if model_name in _model_base_url_map:
+                _srv_mod.AI_BASE_URL = _model_base_url_map[model_name]
+                key = _model_api_key_map.get(model_name) or _runtime_key_for_base_url(_model_base_url_map[model_name])
+                if key:
+                    _srv_mod.AI_API_KEY = key
             return True, f"✅ Model permanently switched to `{model_name}` (global)."
         else:
             # Session-scoped override (live, no restart)
             _session_model_overrides[session_id] = model_name
-            # Also switch base URL if we know it for this model
+            # Also switch base URL + API key if we know them for this model
             if model_name in _model_base_url_map:
                 _session_base_url_overrides[session_id] = _model_base_url_map[model_name]
+            if model_name in _model_api_key_map:
+                _session_api_key_overrides[session_id] = _model_api_key_map[model_name]
+            elif model_name in _model_base_url_map:
+                # Fall back to runtime key inference from the base URL
+                key = _runtime_key_for_base_url(_model_base_url_map[model_name])
+                if key:
+                    _session_api_key_overrides[session_id] = key
             return True, f"✅ Model switched to `{model_name}` for this session."
 
     return False, None
@@ -165,7 +290,10 @@ def _sessions_path() -> Path:
 
 
 def _messages_path(session_id: str) -> Path:
-    return STORE_PATH / f"messages_{session_id}.json"
+    # SECURITY: session_id is client-controlled — never allow path traversal.
+    # Only safe chars pass through; anything else is scrubbed.
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", session_id or "")
+    return STORE_PATH / f"messages_{safe}.json"
 
 
 def load_sessions() -> list[dict]:
@@ -522,9 +650,38 @@ async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
     return {"status": "ok", "deleted": session_id}
 
 
+# ─── Models cache (module-level, populated lazily) ───
+_models_cache: dict = {}
+_models_cache_ts: float = 0.0
+
+
 @app.get("/api/models")
 async def list_models(session_id: str = "", user: dict = Depends(verify_bearer)):
-    """List available models — only from providers we can actually query."""
+    """List available models — only from providers we can actually query.
+
+    Runs the (blocking) provider queries on a thread executor so the event
+    loop never freezes, and caches the result for 120s so the app's model
+    picker opens instantly on repeat visits.
+    """
+    import time as _time
+    global _models_cache_ts
+    # TTL cache: fresh results for 120s, then refetch
+    cache_ttl = 120
+    now = _time.time()
+    if now - _models_cache_ts < cache_ttl:
+        return _models_cache
+
+    # Offload the blocking provider queries off the event loop
+    result = await asyncio.to_thread(_fetch_models_sync, session_id)
+
+    _models_cache.clear()
+    _models_cache.update(result)
+    _models_cache_ts = now
+    return result
+
+
+def _fetch_models_sync(session_id: str) -> dict:
+    """Blocking model fetch — runs in a worker thread, NOT the event loop."""
     from hermes_features import _list_available_models, AI_MODEL, AI_BASE_URL, _read_config_yaml
     import urllib.request, urllib.error
 
@@ -619,10 +776,14 @@ async def list_models(session_id: str = "", user: dict = Depends(verify_bearer))
                 "baseUrl": cp.get("base_url", ""),
             })
 
-    # Build base URL map for provider-aware switching
+    # Build base URL + API key maps for provider-aware switching.
+    # Keys resolve at runtime from config/env — nothing hardcoded.
     for m in models:
         if m.get("baseUrl"):
             _model_base_url_map[m["id"]] = m["baseUrl"]
+            key = _runtime_key_for_base_url(m["baseUrl"])
+            if key:
+                _model_api_key_map[m["id"]] = key
 
     current = _session_model_overrides.get(session_id, AI_MODEL)
     return {
@@ -679,12 +840,14 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
 
     loop = AgentLoop(
         ai_base_url=effective_base_url,
-        ai_api_key=AI_API_KEY,
+        ai_api_key=_resolve_api_key(session_id),
         ai_model=effective_model,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
     )
 
     async def event_generator() -> AsyncGenerator[str, None]:
+        # List + join: O(n) — string += in a loop is O(n²) for long streams
+        response_chunks: list[str] = []
         full_assistant_response = ""
         try:
             async for event in loop.run(openai_messages, query, session_id=session_id,
@@ -697,9 +860,10 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
                         raw = event[6:].strip()
                         data = json.loads(raw)
                         if data.get('type') == 'text':
-                            full_assistant_response += data.get('content', '')
+                            response_chunks.append(data.get('content', ''))
                     except (json.JSONDecodeError, IndexError):
                         pass
+            full_assistant_response = "".join(response_chunks)
         except asyncio.CancelledError:
             # Client disconnected — save what we have
             logger.warning(f"Stream cancelled for session {session_id}, saving partial response")
@@ -708,7 +872,9 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             return
         except Exception as e:
             logger.error(f"Stream error for session {session_id}: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'content': f'⚠ Agent error: {e}'})}\n\n"
+            # Don't leak raw internals to the app — log detail, send friendly text
+            friendly = "Agent error while generating response. Try again or switch model."
+            yield f"data: {json.dumps({'type': 'error', 'content': f'⚠ {friendly}'})}\n\n"
             yield "data: [DONE]\n\n"
             return
 
@@ -753,12 +919,14 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
 
     loop = AgentLoop(
         ai_base_url=effective_base_url,
-        ai_api_key=AI_API_KEY,
+        ai_api_key=_resolve_api_key(session_id),
         ai_model=effective_model,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
     )
 
     openai_messages = _build_openai_messages(session_id)
+    # List + join: O(n) — string += in a loop is O(n²) for long responses
+    response_chunks: list[str] = []
     final_response = ""
     error_msg = None
 
@@ -770,13 +938,15 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
                     raw = event[6:].strip()
                     data = json.loads(raw)
                     if data.get('type') == 'text':
-                        final_response += data.get('content', '')
+                        response_chunks.append(data.get('content', ''))
                     elif data.get('type') == 'error':
                         error_msg = data.get('content', 'Agent error')
                 except (json.JSONDecodeError, IndexError):
                     pass
     except Exception as e:
         error_msg = str(e)
+
+    final_response = "".join(response_chunks)
 
     if error_msg:
         return {"response": f"⚠️ {error_msg}", "session_id": session_id}
@@ -924,10 +1094,31 @@ async def setup_qr(request: Request, token: str = ""):
 
 @app.get("/setup/connect")
 async def setup_connect(request: Request, token: str = ""):
-    """Return connection JSON for the app to auto-configure."""
+    """Return connection JSON for the app to auto-configure.
+    Route-aware: replies with the URL matching the route the caller used
+    (tunnel caller → current live tunnel URL; Tailscale caller → 100.x),
+    so a refresh never switches an app to an unreachable address."""
     # Accept: ?token=SETUP_TOKEN (QR pairing) OR valid JWT / bridge key (app session)
     if not (token == SETUP_TOKEN or _is_authorized(request)):
         raise HTTPException(status_code=401, detail="Invalid setup token")
+
+    # Which route did the caller use to reach us?
+    host_header = (request.headers.get("host") or "").lower()
+
+    # 1. Caller came through the Cloudflare tunnel → give them the CURRENT
+    #    live tunnel URL (kept fresh by tunnel_supervisor.py).
+    if "trycloudflare.com" in host_header:
+        tunnel_url = _detect_tunnel_url()
+        if tunnel_url:
+            return {
+                "url": tunnel_url,
+                "key": HERMES_API_KEY,
+                "model": AI_MODEL,
+                "provider": AI_BASE_URL,
+                "version": "2.2.1",
+            }
+
+    # 2. Caller used the Tailscale IP directly → keep them on Tailscale.
     ts_ip = _detect_host_ip()
     if ts_ip and ts_ip.startswith("100."):
         return {
@@ -939,6 +1130,8 @@ async def setup_connect(request: Request, token: str = ""):
             "provider": AI_BASE_URL,
             "version": "2.2.1",
         }
+
+    # 3. Fallback: tunnel → LAN IP (last resort)
     tunnel_url = _detect_tunnel_url()
     if tunnel_url:
         return {
