@@ -40,13 +40,9 @@ def _setup_parser(subparser) -> None:
         "--no-omniroute", action="store_true",
         help="Skip OmniRoute auto-lifecycle management",
     )
-    subparser.add_argument(
-        "--tunnel", action="store_true",
-        help="Auto-start a Cloudflare tunnel",
-    )
 
 
-def _start_server(port: int, host: str, omniroute: bool, tunnel: bool) -> None:
+def _start_server(port: int, host: str, omniroute: bool) -> None:
     """Start the Hermes Mobile Bridge server."""
     bridge_dir = Path(__file__).resolve().parent.parent.parent.parent / "hermes-mobile-server"
     if not bridge_dir.exists():
@@ -280,5 +276,4 @@ def _handle_mobile_serve(args: argparse.Namespace) -> None:
         port=args.port,
         host=args.host,
         omniroute=not args.no_omniroute,
-        tunnel=args.tunnel,
     )
