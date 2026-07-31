@@ -980,6 +980,18 @@ def _detect_host_ip() -> str:
     if ts_ip and ts_ip.startswith("100."):
         return ts_ip
 
+    # 0b. Config-file override (~/.hermes-mobile-server/tailscale-ip)
+    # Android Termux can't run `ip addr` (netlink needs root), so we support
+    # a manually-written file: `echo 100.x.y.z > tailscale-ip`
+    try:
+        ts_file = STORE_PATH / "tailscale-ip"
+        if ts_file.exists():
+            ip = ts_file.read_text().strip()
+            if ip and ip.startswith("100."):
+                return ip
+    except Exception:
+        pass
+
     # 1. Tailscale IP (primary — via tailscale0 interface or CLI)
     try:
         result = subprocess.run(
