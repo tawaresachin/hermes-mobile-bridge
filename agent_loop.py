@@ -163,6 +163,14 @@ class AgentLoop:
                 # AI is done — no more tool calls
                 break
 
+            # Persist any assistant text spoken alongside the tool calls —
+            # otherwise the next AI iteration loses it (context loss).
+            if full_response.strip():
+                all_messages.append({
+                    "role": "assistant",
+                    "content": full_response,
+                })
+
             # --- Execute each tool ---
             result_texts = []
             for tc in tool_calls:

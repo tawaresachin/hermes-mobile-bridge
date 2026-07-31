@@ -352,7 +352,9 @@ app = FastAPI(title="Hermes Mobile Bridge", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Native app doesn't send Origin (no browser CORS) — localhost allows dev tooling.
+    # Credentials + wildcard is spec-invalid, so use explicit localhost origins.
+    allow_origins=["http://localhost", "http://127.0.0.1", "http://localhost:8080"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -780,17 +782,12 @@ async def upload_file(
     file: UploadFile = File(...),
 ):
     """Upload a file to the session's uploads directory."""
-    # Verify JWT auth
+    # Verify JWT auth — header only (query-param tokens leak into access logs)
     payload = None
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
         payload = decode_access_token(token, JWT_SECRET)
-    if not payload:
-        # Also check query param ?token=xxx
-        token = request.query_params.get("token")
-        if token:
-            payload = decode_access_token(token, JWT_SECRET)
     if not payload:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
@@ -864,9 +861,17 @@ async def download_apk():
 
 # ─── QR Code Setup Endpoints ─────────────────────────────────────────
 
+# One-time setup token — required to fetch /setup/qr and /setup/connect.
+# Carried inside the QR payload so scanning works, but random internet
+# scanners hitting the public tunnel get 401 instead of the API key.
+SETUP_TOKEN = os.getenv("SETUP_TOKEN") or secrets.token_urlsafe(12)
+
+
 @app.get("/setup/qr")
-async def setup_qr():
+async def setup_qr(token: str = ""):
     """Return a QR code PNG that the mobile app scans to auto-configure."""
+    if token != SETUP_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid setup token")
     import io
     try:
         import qrcode
@@ -877,13 +882,13 @@ async def setup_qr():
     # Tailscale IP (primary) → tunnel URL (fallback) → LAN IP (last resort)
     ts_ip = _detect_host_ip()
     if ts_ip and ts_ip.startswith("100."):
-        setup_url = f"hermes://connect?host={ts_ip}&port={PORT}&key={HERMES_API_KEY}"
+        setup_url = f"hermes://connect?host={ts_ip}&port={PORT}&key={HERMES_API_KEY}&setup={SETUP_TOKEN}"
     else:
         tunnel_url = _detect_tunnel_url()
         if tunnel_url:
-            setup_url = f"hermes://connect?url={tunnel_url}&key={HERMES_API_KEY}"
+            setup_url = f"hermes://connect?url={tunnel_url}&key={HERMES_API_KEY}&setup={SETUP_TOKEN}"
         else:
-            setup_url = f"hermes://connect?host={ts_ip}&port={PORT}&key={HERMES_API_KEY}"
+            setup_url = f"hermes://connect?host={ts_ip}&port={PORT}&key={HERMES_API_KEY}&setup={SETUP_TOKEN}"
 
     img = qrcode.make(setup_url, image_factory=PilImage)
     buf = io.BytesIO()
@@ -893,8 +898,10 @@ async def setup_qr():
 
 
 @app.get("/setup/connect")
-async def setup_connect():
+async def setup_connect(token: str = ""):
     """Return connection JSON for the app to auto-configure."""
+    if token != SETUP_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid setup token")
     ts_ip = _detect_host_ip()
     if ts_ip and ts_ip.startswith("100."):
         return {
@@ -1192,8 +1199,8 @@ if __name__ == "__main__":
     print(f"   Store: {STORE_PATH}")
     try:
         _setup_ip = _detect_host_ip()
-        print(f"📱 App setup: http://{_setup_ip}:{PORT}/setup/connect")
-        print(f"📱 Scan QR:   http://{_setup_ip}:{PORT}/setup/qr")
+        print(f"📱 App setup: http://{_setup_ip}:{PORT}/setup/connect?token={SETUP_TOKEN}")
+        print(f"📱 Scan QR:   http://{_setup_ip}:{PORT}/setup/qr?token={SETUP_TOKEN}")
     except Exception:
         pass
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")

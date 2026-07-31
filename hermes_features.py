@@ -660,6 +660,14 @@ def handle_command(query: str, session_id: str) -> tuple[bool, str | None]:
         return True, "\n".join(lines)
 
     if cmd in ("/reset", "/new"):
+        # Actually clear the session history so the model starts fresh
+        from server import _messages_path  # circular-safe import
+        try:
+            msgs_path = _messages_path(session_id)
+            if msgs_path and msgs_path.exists():
+                msgs_path.unlink()
+        except Exception:
+            pass
         return True, "✅ Session reset. Starting fresh."
 
     if cmd == "/retry":
@@ -669,6 +677,13 @@ def handle_command(query: str, session_id: str) -> tuple[bool, str | None]:
         )
 
     if cmd == "/clear":
+        from server import _messages_path
+        try:
+            msgs_path = _messages_path(session_id)
+            if msgs_path and msgs_path.exists():
+                msgs_path.unlink()
+        except Exception:
+            pass
         return True, "✅ Session cleared."
 
     # ─── Model ──────────────────────────────────────────────────────
