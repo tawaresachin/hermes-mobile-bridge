@@ -13,7 +13,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sys
+import re
+import secrets
+import shutil
+import subprocess
+import time
+import urllib.request
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -43,28 +48,12 @@ def _setup_parser(subparser) -> None:
 
 def _start_server(port: int, host: str, omniroute: bool, tunnel: bool) -> None:
     """Start the Hermes Mobile Bridge server."""
-    # Import bridge server — it's designed to run as __main__
-    # We re-use its config, app, and agent loop
     bridge_dir = Path(__file__).resolve().parent.parent.parent.parent / "hermes-mobile-server"
     if not bridge_dir.exists():
-        # Fall back to bundled copy or current directory
-        bridge_dir = Path.cwd()
-
-    # Ensure bridge server is on path
-    sys.path.insert(0, str(bridge_dir))
-
-    # Apply OmniRoute config if enabled
-    if omniroute:
-        _ensure_omnirouter()
-
-    # Launch the bridge server as a subprocess
-    # (it has its own venv/deps, so we don't import directly)
-    import subprocess
-    bridge_dir = Path(__file__).resolve().parent.parent.parent.parent / "hermes-mobile-server"
-
+        bridge_dir = Path.home() / "hermes-mobile-server"
     if not bridge_dir.exists():
-        print("⚠ Bridge server not found. Clone it:")
-        print(f"   git clone https://github.com/tawaresachin/hermes-mobile-bridge.git {bridge_dir}")
+        print("⚠ Bridge server not found at ~/hermes-mobile-server/")
+        print("   Clone it: git clone https://github.com/tawaresachin/hermes-mobile-bridge.git")
         return
 
     env = os.environ.copy()
@@ -73,32 +62,32 @@ def _start_server(port: int, host: str, omniroute: bool, tunnel: bool) -> None:
     env["HOST"] = host
     env["PORT"] = str(port)
 
-    print(f"🤖 Hermes Mobile Bridge (plugin mode) starting on http://{host}:{port}")
+    print(f"🤖 Hermes Mobile Bridge starting on http://{host}:{port}")
+
+    if omniroute:
+        _ensure_omnirouter()
+    ts_ip = _ensure_tailscale()
+
+    if ts_ip:
+        print(f"   🖧 Tailscale: {ts_ip}")
+        env["HERMES_TAILSCALE_IP"] = ts_ip
+
     print(f"   AI: {env['AI_MODEL']} @ {env['AI_BASE_URL']}")
     print(f"   Plugin: ~/.hermes/plugins/mobile-bridge/")
-    print(f"   Bridge: {bridge_dir}/server.py")
 
     subprocess.run(
-        [sys.executable, "-B", "server.py"],
+        ["/data/data/com.termux/files/usr/bin/python3", "-B", "server.py"],
         cwd=str(bridge_dir),
         env=env,
     )
 
 
 def _ensure_omnirouter() -> None:
-    """Auto-lifecycle for OmniRoute: install → start → configure."""
-    import secrets
-    import shutil
-    import subprocess
-    import time
-    import urllib.request
-
+    """Auto-lifecycle for OmniRoute: install -> start -> configure."""
     or_url = "http://localhost:20128/v1"
-    or_key = os.environ.get("HERMES_CUSTOM_LOCALHOST_20128_API_KEY", "")
-    if not or_key:
-        or_key = os.environ.get("OMNIROUTE_API_KEY", "")
+    or_key = os.environ.get("HERMES_CUSTOM_LOCALHOST_20128_API_KEY", "") or \
+             os.environ.get("OMNIROUTE_API_KEY", "")
 
-    # 1. Install if missing
     or_bin = shutil.which("omniroute")
     if not or_bin:
         logger.info("OmniRoute not found — installing via npm...")
@@ -113,13 +102,13 @@ def _ensure_omnirouter() -> None:
         logger.warning("OmniRoute not available — continuing without it")
         return
 
-    # 2. Start if not running
     running = False
     try:
         req = urllib.request.Request(f"{or_url}/models",
                                      headers={"User-Agent": "HermesBridge/2.0"})
         with urllib.request.urlopen(req, timeout=3):
             running = True
+            logger.info("OmniRoute server already running")
     except Exception:
         pass
 
@@ -144,12 +133,10 @@ def _ensure_omnirouter() -> None:
         except Exception as e:
             logger.warning("Failed to start OmniRoute: %s", e)
 
-    # 3. API key
-    if not or_key:
+    if not or_key and running:
         or_key = f"sk-{secrets.token_hex(16)}"
         os.environ["HERMES_CUSTOM_LOCALHOST_20128_API_KEY"] = or_key
 
-    # 4. Set env vars for the bridge server
     if not os.environ.get("AI_BASE_URL"):
         os.environ["AI_BASE_URL"] = or_url
     if not os.environ.get("AI_MODEL"):
@@ -161,6 +148,110 @@ def _ensure_omnirouter() -> None:
                 os.environ.get("AI_MODEL", "?"),
                 os.environ.get("AI_BASE_URL", "?"),
                 or_key[:8] if or_key else "none", or_key[-4:] if or_key else "")
+
+
+def _ensure_tailscale() -> str:
+    """Ensure Tailscale on the bridge device: detect → auto-install APK → guide.
+    Returns the Tailscale IP or empty string."""
+    ts_bin = shutil.which("tailscale")
+    ts_ip = ""
+
+    # 1. Detect Tailscale IP from network interfaces (Android app mode — no CLI needed)
+    ts_ip = _detect_tailscale_ip()
+    if ts_ip:
+        return ts_ip
+
+    # 2. Try CLI
+    if ts_bin:
+        try:
+            result = subprocess.run(
+                [ts_bin, "ip", "-4"], capture_output=True, text=True, timeout=5,
+            )
+            ip = result.stdout.strip()
+            if ip and ip.startswith("100."):
+                logger.info("Tailscale: %s", ip)
+                return ip
+        except Exception:
+            pass
+
+    # 3. Auto-install the Tailscale Android app (APK) if missing
+    if not _is_tailscale_app_installed():
+        _auto_install_tailscale_app()
+
+    # 4. Re-check after install attempt
+    ts_ip = _detect_tailscale_ip()
+    if ts_ip:
+        logger.info("Tailscale active after setup: %s", ts_ip)
+        return ts_ip
+
+    # 5. Not available — guide user
+    print()
+    print("  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║  Tailscale not active                                     ║")
+    print("  ║                                                           ║")
+    print("  ║  1. Install the Tailscale app (auto-attempted) or from    ║")
+    print("  ║     Play Store / F-Droid.                                 ║")
+    print("  ║  2. Open the app and sign in (same account as phone).     ║")
+    print("  ║  3. Restart 'hermes mobile-serve'.                        ║")
+    print("  ║                                                           ║")
+    print("  ║  Until then: Cloudflare tunnel is used as fallback.       ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    print()
+    logger.info("Tailscale not active — using Cloudflare tunnel fallback")
+
+    return ts_ip
+
+
+def _detect_tailscale_ip() -> str:
+    """Look for a 100.x Tailscale IP on any network interface."""
+    try:
+        result = subprocess.run(
+            ["ip", "addr"], capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if "100." in line and "inet " in line:
+                match = re.search(r"inet (100\.\d+\.\d+\.\d+)", line)
+                if match:
+                    return match.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def _is_tailscale_app_installed() -> bool:
+    """Check if the Tailscale Android app is installed."""
+    try:
+        result = subprocess.run(
+            ["pm", "list", "packages", "com.tailscale.ipn"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "com.tailscale.ipn" in result.stdout
+    except Exception:
+        return False
+
+
+def _auto_install_tailscale_app() -> None:
+    """Guide installation of the Tailscale Android app (Play Store / F-Droid)."""
+    logger.info("Tailscale app not installed — opening store for one-tap install...")
+    print()
+    print("  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║  Tailscale app not installed.                            ║")
+    print("  ║  Opening Play Store / F-Droid page...                    ║")
+    print("  ║  Tap 'Install', then open the app and sign in.           ║")
+    print("  ║  Use the SAME account as your app phone.                 ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    print()
+
+    # Open Play Store page for Tailscale
+    try:
+        subprocess.run(
+            ["am", "start", "-a", "android.intent.action.VIEW",
+             "-d", "market://details?id=com.tailscale.ipn"],
+            capture_output=True, text=True, timeout=10,
+        )
+        logger.info("Opened Play Store for com.tailscale.ipn")
+    except Exception as e:
+        logger.warning("Could not open Play Store: %s", e)
 
 
 # ─── Plugin entry point ──────────────────────────────────────────────
