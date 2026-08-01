@@ -90,46 +90,106 @@ def _ensure_forced_defaults(bridge_dir: Path) -> None:
 
 
 def _bootstrap_server(bridge_dir: Path) -> None:
-    """First-run bootstrap: if the bridge server code isn't present yet,
-    clone the repo and install its Python deps automatically — so a fresh
-    install only needs `hermes plugins install .../plugin` + `mobile-serve`."""
-    if (bridge_dir / "server.py").exists():
-        return
-    print("   ⬇ Bridge server not found — bootstrapping…")
-    try:
-        import urllib.request
-        git_url = "https://github.com/tawaresachin/hermes-mobile-bridge.git"
-        bridge_dir.parent.mkdir(parents=True, exist_ok=True)
-        r = subprocess.run(
-            ["git", "clone", "--depth", "1", git_url, str(bridge_dir)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if r.returncode != 0 or not (bridge_dir / "server.py").exists():
-            raise RuntimeError((r.stderr or r.stdout or "clone failed").strip()[:300])
-        print("   ✅ Server cloned to", bridge_dir)
-    except Exception as e:
-        print(f"   ⚠ Auto-bootstrap failed: {e}")
-        print("     Clone manually: git clone https://github.com/tawaresachin/hermes-mobile-bridge")
-        raise
-
-    # Install Python deps (idempotent — pip skips already-satisfied).
-    try:
-        req = bridge_dir / "requirements.txt"
-        if req.exists():
-            py = sys.executable
-            print("   📦 Installing dependencies (pip install -r requirements.txt)…")
+    """First-run bootstrap + auto-update:
+    - server code missing → clone the repo + install deps (fresh install)
+    - server code present AND it's a git checkout we manage → `git pull` so
+      every `hermes mobile-serve` start picks up the latest code (updates).
+    Set BRIDGE_AUTO_UPDATE=0 to disable the pull."""
+    if not (bridge_dir / "server.py").exists():
+        print("   ⬇ Bridge server not found — bootstrapping…")
+        try:
+            import urllib.request
+            bridge_dir.parent.mkdir(parents=True, exist_ok=True)
             r = subprocess.run(
-                [py, "-m", "pip", "install", "-q", "-r", str(req)],
-                capture_output=True, text=True, timeout=300,
+                ["git", "clone", "--depth", "1", GIT_URL, str(bridge_dir)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if r.returncode != 0 or not (bridge_dir / "server.py").exists():
+                raise RuntimeError((r.stderr or r.stdout or "clone failed").strip()[:300])
+            print("   ✅ Server cloned to", bridge_dir)
+        except Exception as e:
+            print(f"   ⚠ Auto-bootstrap failed: {e}")
+            print("     Clone manually: git clone https://github.com/tawaresachin/hermes-mobile-bridge")
+            raise
+
+        # Install Python deps (idempotent — pip skips already-satisfied).
+        try:
+            req = bridge_dir / "requirements.txt"
+            if req.exists():
+                py = sys.executable
+                print("   📦 Installing dependencies (pip install -r requirements.txt)…")
+                r = subprocess.run(
+                    [py, "-m", "pip", "install", "-q", "-r", str(req)],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if r.returncode != 0:
+                    logger.warning("pip install had warnings: %s", (r.stderr or "")[:200])
+        except Exception as e:
+            logger.warning("Dependency install failed: %s", e)
+        return
+
+    # Server exists — auto-update if it's a git checkout we manage.
+    auto_update = os.getenv("BRIDGE_AUTO_UPDATE", "1").lower() not in ("0", "false", "no", "off")
+    if auto_update and (bridge_dir / ".git").exists():
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(bridge_dir), "pull", "--ff-only", "-q"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode == 0 and r.stdout.strip() and "Already up to date" not in r.stdout:
+                print("   🔄 Server updated:", r.stdout.strip().splitlines()[-1][:80])
+        except Exception as e:
+            logger.warning("Server auto-update skipped: %s", e)
+
+
+GIT_URL = "https://github.com/tawaresachin/hermes-mobile-bridge.git"
+
+
+def _self_update_plugin() -> None:
+    """Keep the INSTALLED PLUGIN in sync with the repo (copy-install safe).
+
+    Hermes subdir installs keep no `.git` in the installed plugin dir, so
+    `hermes plugins update` can't pull. Instead we shallow-clone the repo and
+    swap __init__.py + plugin.yaml. No-op when running from inside the repo
+    (symlink/dev layout). Changes apply on the NEXT start. Gate:
+    BRIDGE_AUTO_UPDATE=0 disables."""
+    auto_update = os.getenv("BRIDGE_AUTO_UPDATE", "1").lower() not in ("0", "false", "no", "off")
+    if not auto_update:
+        return
+    plugin_dir = Path(__file__).resolve().parent
+    # Inside the repo (symlink or dev checkout) — the repo IS the source.
+    if (plugin_dir.parent / "server.py").exists():
+        return
+    try:
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            clone = Path(tmp) / "repo"
+            r = subprocess.run(
+                ["git", "clone", "--depth", "1", GIT_URL, str(clone)],
+                capture_output=True, text=True, timeout=120,
             )
             if r.returncode != 0:
-                logger.warning("pip install had warnings: %s", (r.stderr or "")[:200])
+                raise RuntimeError((r.stderr or "clone failed").strip()[:200])
+            src = clone / "plugin"
+            changed = False
+            for f in ("__init__.py", "plugin.yaml"):
+                if (src / f).exists():
+                    dst = plugin_dir / f
+                    if not dst.exists() or dst.read_bytes() != (src / f).read_bytes():
+                        shutil.copy2(src / f, dst)
+                        changed = True
+            if changed:
+                print("   🔄 Plugin updated (applies on next start)")
     except Exception as e:
-        logger.warning("Dependency install failed: %s", e)
+        logger.warning("Plugin self-update skipped: %s", e)
 
 
 def _start_server(port: int, host: str, omniroute: bool) -> None:
     """Start the Hermes Mobile Bridge server (cross-platform)."""
+    # Keep the plugin itself current (copy-installs have no .git to pull).
+    _self_update_plugin()
+
     # Smart bridge dir resolution: the plugin ships INSIDE the bridge repo
     # (plugin/__init__.py), so prefer the repo next to us; fall back to the
     # legacy ~/hermes-mobile-server location for copy-installs.

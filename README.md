@@ -39,6 +39,22 @@ hermes mobile-serve
 `CAVEMAN_STYLE=1`, `CONTEXT_RECENT_K=24`, `CONTEXT_SUMMARY_BATCH=12` (caveman
 replies + flat token usage on long sessions — every conversation, every restart).
 
+### Updating
+
+**Server + bridge code** — automatic. Every `hermes mobile-serve` start runs
+`git pull` on the managed checkout (`BRIDGE_AUTO_UPDATE=0` disables). New
+server features go live on the next restart — no manual step.
+
+**Plugin** — one command (Hermes subdir installs keep no `.git`, so reinstall
+is the update path):
+
+```bash
+hermes plugins install tawaresachin/hermes-mobile-bridge/plugin --enable --force
+```
+
+(If you cloned the server repo manually instead of letting it bootstrap,
+`git -C ~/hermes-mobile-server pull` also works.)
+
 ### Standalone (no Hermes)
 
 ```bash
