@@ -89,6 +89,45 @@ def _ensure_forced_defaults(bridge_dir: Path) -> None:
         logger.warning("Could not write forced defaults to %s: %s", env_path, e)
 
 
+def _bootstrap_server(bridge_dir: Path) -> None:
+    """First-run bootstrap: if the bridge server code isn't present yet,
+    clone the repo and install its Python deps automatically — so a fresh
+    install only needs `hermes plugins install .../plugin` + `mobile-serve`."""
+    if (bridge_dir / "server.py").exists():
+        return
+    print("   ⬇ Bridge server not found — bootstrapping…")
+    try:
+        import urllib.request
+        git_url = "https://github.com/tawaresachin/hermes-mobile-bridge.git"
+        bridge_dir.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(
+            ["git", "clone", "--depth", "1", git_url, str(bridge_dir)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0 or not (bridge_dir / "server.py").exists():
+            raise RuntimeError((r.stderr or r.stdout or "clone failed").strip()[:300])
+        print("   ✅ Server cloned to", bridge_dir)
+    except Exception as e:
+        print(f"   ⚠ Auto-bootstrap failed: {e}")
+        print("     Clone manually: git clone https://github.com/tawaresachin/hermes-mobile-bridge")
+        raise
+
+    # Install Python deps (idempotent — pip skips already-satisfied).
+    try:
+        req = bridge_dir / "requirements.txt"
+        if req.exists():
+            py = sys.executable
+            print("   📦 Installing dependencies (pip install -r requirements.txt)…")
+            r = subprocess.run(
+                [py, "-m", "pip", "install", "-q", "-r", str(req)],
+                capture_output=True, text=True, timeout=300,
+            )
+            if r.returncode != 0:
+                logger.warning("pip install had warnings: %s", (r.stderr or "")[:200])
+    except Exception as e:
+        logger.warning("Dependency install failed: %s", e)
+
+
 def _start_server(port: int, host: str, omniroute: bool) -> None:
     """Start the Hermes Mobile Bridge server (cross-platform)."""
     # Smart bridge dir resolution: the plugin ships INSIDE the bridge repo
@@ -96,6 +135,7 @@ def _start_server(port: int, host: str, omniroute: bool) -> None:
     # legacy ~/hermes-mobile-server location for copy-installs.
     repo_root = Path(__file__).resolve().parent.parent
     bridge_dir = repo_root if (repo_root / "server.py").exists() else Path.home() / "hermes-mobile-server"
+    _bootstrap_server(bridge_dir)  # fresh installs auto-clone + install deps
     if not bridge_dir.exists():
         print("⚠ Bridge server not found. Clone: git clone https://github.com/tawaresachin/hermes-mobile-bridge")
         return

@@ -20,16 +20,34 @@ export HERMES_API_KEY="your-secret-key"
 python3 server.py                        # standalone
 ```
 
-### With Hermes (recommended)
+### With Hermes (recommended — fully automatic)
 
 ```bash
-hermes plugins install tawaresachin/hermes-mobile-bridge   # installs plugin/ as mobile-bridge
-hermes mobile-serve                                        # auto: OS detect → OmniRoute → Tailscale → tunnel → server
+hermes plugins install tawaresachin/hermes-mobile-bridge/plugin --enable
+hermes mobile-serve
 ```
+
+**That's it — two commands on any OS.** What happens automatically:
+
+1. `plugins install .../plugin --enable` clones the repo, installs the `mobile-bridge`
+   plugin (subdir-aware installer), and enables it
+2. `hermes mobile-serve` **bootstraps the server itself** if missing (auto-clone +
+   `pip install -r requirements.txt`), then: OS auto-detect → OmniRoute → Tailscale →
+   Cloudflare tunnel fallback → forced defaults → server up
 
 `hermes mobile-serve` on first start writes forced defaults to `.env`:
 `CAVEMAN_STYLE=1`, `CONTEXT_RECENT_K=24`, `CONTEXT_SUMMARY_BATCH=12` (caveman
 replies + flat token usage on long sessions — every conversation, every restart).
+
+### Standalone (no Hermes)
+
+```bash
+git clone https://github.com/tawaresachin/hermes-mobile-bridge
+cd hermes-mobile-bridge
+pip install -r requirements.txt
+export HERMES_API_KEY="your-secret-key"
+python3 server.py
+```
 
 ## OS auto-detection
 
