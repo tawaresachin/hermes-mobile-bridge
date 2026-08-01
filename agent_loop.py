@@ -2,6 +2,7 @@
 """Agent loop — orchestrates the AI + tool execution cycle."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -27,6 +28,16 @@ DEFAULT_SYSTEM_PROMPT = (
     "terminal (shell commands), file_ops (read/write/patch/search files), "
     "and web (search/extract URLs). "
     "When a task requires external action, use the appropriate tool."
+)
+
+# Forced by the server at setup (CAVEMAN_STYLE=1 is written into the bridge's
+# .env). Short answers = fewer tokens, faster replies, cheaper voice TTS.
+CAVEMAN_STYLE_RULE = (
+    "\n\n"
+    "IMPORTANT STYLE RULE — ALWAYS respond in Caveman speak: short, simple "
+    "sentences. Use 'me', 'you', 'us'. No big words. No fancy grammar. Say "
+    "things like 'Me fix problem.' / 'You ask good question.' / 'Me think yes.' "
+    "Keep answers short. Still be helpful and accurate — just talk like caveman."
 )
 
 # ─── SSE Event Types ────────────────────────────────────────────────────
@@ -84,6 +95,16 @@ class AgentLoop:
 
     MAX_ITERATIONS = 10  # Prevent infinite tool loops
 
+    # ── Context compaction (learned from the JARVIS voice-assistant
+    # architecture: never feed the whole history to the model) ──
+    # Keep the most recent RECENT_K messages verbatim; older messages are
+    # rolled into a cached summary that gets injected into the system prompt.
+    # A new summarisation batch fires only every SUMMARY_BATCH messages, so
+    # the added latency is amortised (one extra LLM call per batch).
+    RECENT_K = 24
+    SUMMARY_BATCH = 12
+    SUMMARY_MAX_WORDS = 180
+
     def __init__(
         self,
         ai_base_url: str,
@@ -98,6 +119,16 @@ class AgentLoop:
         self.system_prompt = system_prompt
         self.tools = tools or registry
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
+        # Per-session locks so concurrent turns can't race on the summary file
+        self._summary_locks: dict[str, asyncio.Lock] = {}
+        # Context "headroom" tuning — env-forced at setup, always-on defaults.
+        # RECENT_K messages stay verbatim; older ones roll into the summary
+        # in batches of SUMMARY_BATCH (tokens stay flat on long sessions).
+        self.recent_k = int(os.getenv("CONTEXT_RECENT_K", str(AgentLoop.RECENT_K)))
+        self.summary_batch = int(os.getenv("CONTEXT_SUMMARY_BATCH", str(AgentLoop.SUMMARY_BATCH)))
+        # Caveman style: forced ON by the server (CAVEMAN_STYLE=1 written at
+        # setup). Set 0 only to disable explicitly.
+        self.caveman_style = os.getenv("CAVEMAN_STYLE", "1").lower() not in ("0", "false", "no", "off")
 
     async def run(
         self,
@@ -125,9 +156,17 @@ class AgentLoop:
 
         # Build enhanced system prompt with skills, commands, and rules
         enhanced_prompt = build_system_prompt(self.system_prompt)
+        # Caveman style — server-forced (CAVEMAN_STYLE=1 at setup): short
+        # replies save tokens on every turn and keep voice TTS crisp.
+        if self.caveman_style:
+            enhanced_prompt = enhanced_prompt + CAVEMAN_STYLE_RULE
 
-        # Use messages from history — server already saved the query
-        all_messages = list(messages)
+        # Compact long histories: keep the recent window verbatim, roll the
+        # older part into a cached summary appended to the system prompt
+        # (JARVIS-style rolling context — keeps lengthy voice sessions fast).
+        all_messages, summary_block = await self._compacted_context(list(messages), session_id)
+        if summary_block:
+            enhanced_prompt = enhanced_prompt + summary_block
 
         iteration = 0
         while iteration < self.MAX_ITERATIONS:
@@ -219,6 +258,132 @@ class AgentLoop:
 
         # AI finished without (more) tool calls — we're done
         yield sse_done()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Context compaction: rolling summary for lengthy conversations
+    # (JARVIS-style: recent window verbatim + cached older-summary block)
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _summary_path(session_id: str):
+        import os
+        import hashlib
+        # SECURITY + collision-safe: hash the client-controlled id so path
+        # traversal ("../../x") and sanitised collisions ("abc/def" vs
+        # "abcdef") are both impossible. Same store dir as the messages.
+        store = os.getenv("STORE_PATH", os.path.expanduser("~/.hermes-mobile-server"))
+        safe = hashlib.sha256((session_id or "").encode()).hexdigest()[:20]
+        return os.path.join(store, f"summary_{safe}.json")
+
+    def _load_summary_state(self, session_id: str) -> tuple[str, int]:
+        """Return (summary_text, summarized_count) for the session."""
+        try:
+            p = self._summary_path(session_id)
+            if os.path.exists(p):
+                with open(p) as f:
+                    data = json.load(f)
+                return data.get("summary", ""), int(data.get("count", 0))
+        except Exception:
+            pass
+        return "", 0
+
+    def _save_summary_state(self, session_id: str, summary: str, count: int) -> None:
+        try:
+            import os
+            p = self._summary_path(session_id)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                json.dump({"summary": summary, "count": count}, f)
+        except Exception:
+            pass
+
+    async def _summarize(self, previous: str, chunk: list[dict]) -> str:
+        """One LLM call: merge `chunk` into `previous`, return ≤180 words."""
+        system = (
+            "You are a conversation summariser for a voice assistant. "
+            "Compress the conversation below into at most 180 words. "
+            "Keep: user preferences, facts, decisions, names, tasks, and anything "
+            "needed to continue later. Drop: greetings, filler, assistant deflections. "
+            "If a previous summary is given, merge the new messages INTO it "
+            "(update, don't repeat). Output ONLY the summary text."
+        )
+        parts = []
+        if previous:
+            parts.append(f"PREVIOUS SUMMARY:\n{previous}\n")
+        for m in chunk:
+            role = m.get("role", "user")
+            content = str(m.get("content", "") or "")[:2000]
+            if content.strip():
+                parts.append(f"{role.upper()}: {content}")
+        user_content = "\n".join(parts) or "(empty)"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0)) as client:
+                resp = await client.post(
+                    f"{self.ai_base_url.rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.ai_api_key}"},
+                    json={
+                        "model": self.ai_model,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user_content},
+                        ],
+                        "max_tokens": 500,
+                        "stream": False,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+                words = text.split()
+                if len(words) > self.SUMMARY_MAX_WORDS:
+                    text = " ".join(words[: self.SUMMARY_MAX_WORDS])
+                return text.strip()
+        except Exception:
+            return previous  # fail-open: keep the old summary
+
+    async def _compacted_context(self, messages: list[dict], session_id: str) -> tuple[list[dict], str]:
+        """Return (messages_to_send, summary_block_to_append_to_system_prompt).
+
+        When history exceeds RECENT_K + SUMMARY_BATCH, older messages are
+        compressed into a rolling summary (cached per session, re-summarised
+        in batches of SUMMARY_BATCH). Recent messages stay verbatim.
+        """
+        if not session_id or len(messages) <= self.recent_k + self.summary_batch:
+            return messages, ""
+
+        cutoff = len(messages) - self.recent_k
+        older = messages[:cutoff]
+        recent = messages[cutoff:]
+
+        lock = self._summary_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:  # serialise read→summarise→write per session
+            summary, count = self._load_summary_state(session_id)
+            new_batch = older[count:]
+            if len(new_batch) >= self.summary_batch:
+                # Strip reasoning/tool-noise before summarising (keeps the call cheap)
+                clean = [
+                    {k: v for k, v in m.items() if k in ("role", "content")}
+                    for m in new_batch
+                ]
+                summary = await self._summarize(summary, clean)
+                self._save_summary_state(session_id, summary, len(older))
+        # Bound the lock map (dicts preserve insertion order — drop the oldest
+        # entries once it gets large; active sessions re-create their lock).
+        if len(self._summary_locks) > 256:
+            self._summary_locks = dict(list(self._summary_locks.items())[-128:])
+
+        if not summary:
+            # Nothing summarised yet — keep a trimmed tail rather than drop
+            # everything: the oldest SUMMARY_BATCH messages still fit.
+            return recent, ""
+
+        block = (
+            "\n\n[EARLIER CONVERSATION SUMMARY — compressed context from earlier "
+            "in this session. Use it to stay consistent; do not repeat what it "
+            "already covers]:\n"
+            + summary
+        )
+        return recent, block
 
     async def _call_ai(self, messages: list[dict], system_prompt: str | None = None) -> AsyncGenerator[dict, None]:
         """Stream from the AI provider, yielding events.

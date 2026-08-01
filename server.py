@@ -9,15 +9,18 @@ New in v2: User authentication with JWT + refresh tokens.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
 import os
 import re
 import secrets
+import select
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import uuid
@@ -486,6 +489,11 @@ class ChatRequest(BaseModel):
     attachment_type: Optional[str] = None
 
 
+class TtsRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None
+
+
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
@@ -670,6 +678,246 @@ async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
         msgs_path.unlink()
     logger.info(f"Deleted session {session_id} for user {user['sub']}")
     return {"status": "ok", "deleted": session_id}
+
+
+# ─── TTS (Text-to-Speech) ────────────────────────────────────────────────
+
+# Persistent edge-tts worker: spawned once, reused for every request.
+# Protocol: one JSON request per line on stdin; stdout replies with a
+# 4-byte big-endian length prefix + raw MP3 (or 0xFFFFFFFF = error marker).
+
+_EDGE_TTS_WORKER_SCRIPT = r"""
+import asyncio, json, sys
+import edge_tts
+
+async def _synth(text, voice):
+    tts = edge_tts.Communicate(text, voice=voice)
+    out = b""
+    async for chunk in tts.stream():
+        if chunk["type"] == "audio":
+            out += chunk["data"]
+    return out
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    try:
+        req = json.loads(line)
+        text = req.get("text", "")
+        voice = req.get("voice", "en-IN-NeerjaNeural")
+        audio = b""
+        # One internal retry — edge-tts network blips are transient.
+        for attempt in range(2):
+            try:
+                audio = asyncio.run(_synth(text, voice))
+                break
+            except Exception:
+                if attempt == 0:
+                    continue
+                raise
+        sys.stdout.buffer.write(len(audio).to_bytes(4, "big") + audio)
+    except Exception:
+        sys.stdout.buffer.write((0xFFFFFFFF).to_bytes(4, "big"))
+    sys.stdout.buffer.flush()
+"""
+
+
+class _EdgeTtsWorker:
+    """Reusable edge-tts subprocess with crash/timeout recovery and a
+    one-shot fallback after repeated failures (fail-open)."""
+
+    def __init__(self):
+        self._proc: Optional[subprocess.Popen] = None
+        self._r = None      # raw unbuffered reader fd
+        self._w = None      # stdin pipe
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._venv_py = str(Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python3")
+        if not Path(self._venv_py).exists():
+            self._venv_py = "python3"
+
+    def _spawn(self) -> None:
+        self._kill()
+        self._proc = subprocess.Popen(
+            [self._venv_py, "-c", _EDGE_TTS_WORKER_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        self._w = self._proc.stdin
+        # Raw, unbuffered reader — select() + os.read() need no buffering
+        # layer, otherwise buffer/pipe desync would corrupt the protocol.
+        self._r = os.fdopen(self._proc.stdout.fileno(), "rb", buffering=0)
+
+    def _kill(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=2)
+            except Exception:
+                pass
+        # Close the pipe wrappers explicitly BEFORE dropping references —
+        # otherwise Python's GC raises "Bad file descriptor" noise on exit.
+        if self._r is not None:
+            try:
+                self._r.close()
+            except Exception:
+                pass
+        if self._w is not None:
+            try:
+                self._w.close()
+            except Exception:
+                pass
+        self._proc = None
+        self._r = None
+        self._w = None
+
+    def _read_exact(self, n: int, timeout: float) -> bytes:
+        assert self._r is not None, "worker not spawned"
+        buf = b""
+        deadline = time.monotonic() + timeout
+        while len(buf) < n:
+            remaining = max(0.1, deadline - time.monotonic())
+            ready, _, _ = select.select([self._r], [], [], remaining)
+            if not ready:
+                raise TimeoutError("TTS worker read timeout")
+            chunk = os.read(self._r.fileno(), n - len(buf))
+            if not chunk:
+                raise EOFError("TTS worker closed")
+            buf += chunk
+        return buf
+
+    def synth(self, text: str, voice: str, timeout: float = 60.0) -> bytes:
+        with self._lock:
+            if self._failures >= 3:
+                # Repeated worker failures — fail open to the one-shot path
+                # (and reset so a later recovery can come back to the worker).
+                self._failures = 0
+                return self._synth_oneshot(text, voice, timeout)
+            try:
+                if self._proc is None or self._proc.poll() is not None:
+                    self._spawn()
+                assert self._r is not None and self._w is not None, "worker spawn failed"
+                self._w.write(json.dumps({"text": text, "voice": voice}).encode() + b"\n")
+                self._w.flush()
+                header = self._read_exact(4, timeout)
+                length = int.from_bytes(header, "big")
+                if length == 0xFFFFFFFF:
+                    raise RuntimeError("TTS worker reported error")
+                audio = self._read_exact(length, timeout)
+                self._failures = 0
+                return audio
+            except Exception:
+                self._failures += 1
+                self._kill()
+                raise
+
+    def _synth_oneshot(self, text: str, voice: str, timeout: float) -> bytes:
+        script = (
+            "import asyncio, sys, edge_tts\n"
+            "async def m():\n"
+            "    tts = edge_tts.Communicate(sys.argv[1], voice=sys.argv[2])\n"
+            "    out = b''\n"
+            "    async for chunk in tts.stream():\n"
+            "        if chunk['type'] == 'audio':\n"
+            "            out += chunk['data']\n"
+            "    sys.stdout.buffer.write(out)\n"
+            "asyncio.run(m())\n"
+        )
+        proc = subprocess.run(
+            [self._venv_py, "-c", script, text, voice],
+            capture_output=True, timeout=timeout,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            raise RuntimeError(proc.stderr.decode(errors="replace")[:300] or "TTS failed")
+        return proc.stdout
+
+
+_tts_worker = _EdgeTtsWorker()
+
+
+def _strip_markdown_for_speech(text: str) -> str:
+    """Clean markdown/formatting before synthesis so TTS reads naturally
+    (JARVIS-style `_preprocess_for_speech` equivalent)."""
+    import re
+    # Markdown links → link text only
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    # Bold/italic/code/inline markers
+    text = re.sub(r"[*_`~>]", "", text)
+    # Heading hashes at line starts
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)
+    # List dashes/bullets/numbering at line starts
+    text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
+    text = re.sub(r"^\s*\d+[.)]\s+", "", text, flags=re.M)
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# TTS model cache: {sha256(text+voice) -> mp3 path} so repeat bubbles are
+# instant and we don't hammer the TTS provider.
+_tts_cache: dict[str, str] = {}
+
+
+@app.post("/api/tts")
+async def text_to_speech(body: TtsRequest, user: dict = Depends(verify_bearer)):
+    """Synthesize speech from text (Edge TTS via the Hermes venv).
+
+    Returns MP3 audio bytes. Cached by (text, voice) hash so replaying a
+    voice bubble costs nothing. Runs the TTS subprocess on a worker thread
+    so the event loop never blocks.
+    """
+    text = _strip_markdown_for_speech((body.text or "").strip())
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(text) > 4000:
+        raise HTTPException(status_code=400, detail="text too long (max 4000 chars)")
+    # Default Indian English voice (edge-tts). Override with TTS_VOICE env
+    # (e.g. en-IN-PrabhatNeural for male, or any edge-tts voice name).
+    voice = (body.voice or "").strip() or os.getenv("TTS_VOICE", "en-IN-NeerjaNeural")
+
+    # Cache hit?
+    cache_key = hashlib.sha256(f"{text}::{voice}".encode()).hexdigest()
+    cached = _tts_cache.get(cache_key)
+    if cached and Path(cached).exists():
+        return Response(content=Path(cached).read_bytes(), media_type="audio/mpeg")
+
+    # Synthesize via a PERSISTENT edge-tts worker subprocess (spawned once,
+    # reused across requests) so per-sentence TTS doesn't pay Python startup
+    # (~300-500ms) on every sentence of a streamed reply. Falls back to a
+    # one-shot subprocess after repeated worker failures (fail-open).
+    def _synth() -> bytes:
+        return _tts_worker.synth(text, voice, timeout=30)
+
+    try:
+        audio = await asyncio.to_thread(_synth)
+    except Exception as e:
+        # One retry — edge-tts network blips (the 502s seen in production
+        # logs) are usually transient.
+        logger.warning("TTS attempt 1 failed (%s), retrying once", e)
+        try:
+            audio = await asyncio.to_thread(_synth)
+        except Exception as e2:
+            logger.error("TTS failed after retry: %s", e2)
+            raise HTTPException(status_code=502, detail=f"TTS failed: {e2}")
+
+    # Persist to cache dir
+    try:
+        cache_dir = STORE_PATH / "tts_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        fpath = cache_dir / f"{cache_key}.mp3"
+        fpath.write_bytes(audio)
+        _tts_cache[cache_key] = str(fpath)
+        # Bound the cache dict (memory hygiene)
+        if len(_tts_cache) > 100:
+            _tts_cache.pop(next(iter(_tts_cache)))
+    except Exception:
+        pass  # cache is best-effort
+
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 # ─── Models cache (module-level, populated lazily) ───
