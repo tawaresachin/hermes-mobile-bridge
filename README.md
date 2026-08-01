@@ -4,56 +4,45 @@
 
 Lightweight REST/SSE backend for the Hermes Mobile Android app. Ships with:
 - `server.py` — FastAPI bridge (chat stream, sessions, models, TTS, uploads, QR setup)
-- `plugin/` — the Hermes plugin (`hermes mobile-serve`) — installed by symlink, zero copy-drift
+- `plugin/` — the Hermes plugin (`hermes mobile-serve`)
+- `install.py` — **the single command**: installs, updates AND starts everything
 - `platform_utils.py` — OS auto-detection: picks the right Python, downloads cloudflared /
   OmniRoute per-OS, detects Tailscale (CLI on desktop, app-mode on Android)
 - `tunnel_supervisor.py` — Cloudflare quick-tunnel auto-restart + URL tracking
 - `agent_loop.py` — AI + tool orchestration with rolling context summary (JARVIS-style)
 
-## Install (any OS)
+## Install, Update & Start — ONE command
 
 ```bash
-git clone https://github.com/tawaresachin/hermes-mobile-bridge
-cd hermes-mobile-bridge
-pip install -r requirements.txt          # or: pip install fastapi uvicorn httpx bcrypt pyjwt email-validator sse-starlette
-export HERMES_API_KEY="your-secret-key"
-python3 server.py                        # standalone
+curl -fsSL https://raw.githubusercontent.com/tawaresachin/hermes-mobile-bridge/main/install.py | python3 -
 ```
 
-### With Hermes (recommended — fully automatic)
+Idempotent — run it once on a fresh machine, re-run it any time to update:
+
+| Scenario | What it does |
+|---|---|
+| **Fresh machine** | installs the Hermes plugin → clones the server → installs deps → starts `hermes mobile-serve` |
+| **Re-run (update)** | force-reinstalls the plugin → `git pull` the server → restarts the server |
+| **No Hermes CLI** | standalone mode: clones server + deps → runs `python3 server.py` |
+
+Flags: `--no-serve` (install/update only) · `--force` · `--dir DIR` · `--port PORT`.
+
+Requires: Python 3.9+ and git (both needed by Hermes itself anyway).
+
+### Manual (classic two-step)
 
 ```bash
 hermes plugins install tawaresachin/hermes-mobile-bridge/plugin --enable
 hermes mobile-serve
 ```
 
-**That's it — two commands on any OS.** What happens automatically:
-
-1. `plugins install .../plugin --enable` clones the repo, installs the `mobile-bridge`
-   plugin (subdir-aware installer), and enables it
-2. `hermes mobile-serve` **bootstraps the server itself** if missing (auto-clone +
-   `pip install -r requirements.txt`), then: OS auto-detect → OmniRoute → Tailscale →
-   Cloudflare tunnel fallback → forced defaults → server up
+`hermes mobile-serve` alone is enough for day-to-day updates afterwards: it
+self-syncs the plugin and git-pulls the server on every start
+(`BRIDGE_AUTO_UPDATE=0` disables both).
 
 `hermes mobile-serve` on first start writes forced defaults to `.env`:
 `CAVEMAN_STYLE=1`, `CONTEXT_RECENT_K=24`, `CONTEXT_SUMMARY_BATCH=12` (caveman
 replies + flat token usage on long sessions — every conversation, every restart).
-
-### Updating
-
-**Server + bridge code** — automatic. Every `hermes mobile-serve` start runs
-`git pull` on the managed checkout (`BRIDGE_AUTO_UPDATE=0` disables). New
-server features go live on the next restart — no manual step.
-
-**Plugin** — one command (Hermes subdir installs keep no `.git`, so reinstall
-is the update path):
-
-```bash
-hermes plugins install tawaresachin/hermes-mobile-bridge/plugin --enable --force
-```
-
-(If you cloned the server repo manually instead of letting it bootstrap,
-`git -C ~/hermes-mobile-server pull` also works.)
 
 ### Standalone (no Hermes)
 
