@@ -7,3 +7,4 @@ uploads/
 *.apk
 sessions/
 summary_*.json
+.tunnel_supervisor.pid
