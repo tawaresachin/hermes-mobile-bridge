@@ -684,17 +684,61 @@ async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
 # Persistent edge-tts worker: spawned once, reused for every request.
 # Protocol: one JSON request per line on stdin; stdout replies with a
 # 4-byte big-endian length prefix + raw MP3 (or 0xFFFFFFFF = error marker).
+#
+# Provider routing: when ~/.hermes/config.yaml sets `tts.provider` to anything
+# other than edge, synthesis is delegated to Hermes' own text_to_speech_tool —
+# so ElevenLabs / OpenAI / xAI / MiniMax / Gemini / local (piper, neutts) /
+# custom command providers all work by just configuring Hermes. Edge remains
+# the default (free, 9 Indian languages via the app's voice selector).
 
-_EDGE_TTS_WORKER_SCRIPT = r"""
-import asyncio, json, sys
+_EDGE_TTS_WORKER_SCRIPT = r'''
+import asyncio, json, os, sys
+
+# Make Hermes' tool modules importable (worker runs from the hermes venv:
+# venv/bin/python3 -> hermes-agent root).
+_HERMES_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))
+if _HERMES_ROOT not in sys.path:
+    sys.path.insert(0, _HERMES_ROOT)
+
 import edge_tts
 
-async def _synth(text, voice):
+def _configured_provider():
+    try:
+        import yaml
+        cfg_path = os.path.join(os.path.expanduser('~'), '.hermes', 'config.yaml')
+        if os.path.exists(cfg_path):
+            cfg = yaml.safe_load(open(cfg_path)) or {}
+            return ((cfg.get('tts') or {}).get('provider') or 'edge').lower()
+    except Exception:
+        pass
+    return 'edge'
+
+def _hermes_synth(text):
+    """Delegate to Hermes' text_to_speech_tool (premium / custom providers)."""
+    import tempfile
+    from tools.tts_tool import text_to_speech_tool
+    out = tempfile.mktemp(suffix='.mp3')
+    try:
+        result = text_to_speech_tool(text, output_path=out)
+        data = json.loads(result) if isinstance(result, str) else result
+        if data.get('success') and os.path.exists(out):
+            audio = open(out, 'rb').read()
+            if audio:
+                return audio
+            raise RuntimeError('hermes TTS produced empty audio')
+        raise RuntimeError(str(data.get('error') or 'hermes TTS failed')[:200])
+    finally:
+        try:
+            os.unlink(out)
+        except Exception:
+            pass
+
+async def _edge_synth(text, voice):
     tts = edge_tts.Communicate(text, voice=voice)
-    out = b""
+    out = b''
     async for chunk in tts.stream():
-        if chunk["type"] == "audio":
-            out += chunk["data"]
+        if chunk['type'] == 'audio':
+            out += chunk['data']
     return out
 
 while True:
@@ -703,23 +747,25 @@ while True:
         break
     try:
         req = json.loads(line)
-        text = req.get("text", "")
-        voice = req.get("voice", "en-IN-NeerjaNeural")
-        audio = b""
-        # One internal retry — edge-tts network blips are transient.
+        text = req.get('text', '')
+        voice = req.get('voice', 'en-IN-NeerjaNeural')
+        # One internal retry — transient network blips.
         for attempt in range(2):
             try:
-                audio = asyncio.run(_synth(text, voice))
+                if _configured_provider() in ('edge', '', None):
+                    audio = asyncio.run(_edge_synth(text, voice))
+                else:
+                    audio = _hermes_synth(text)
                 break
             except Exception:
                 if attempt == 0:
                     continue
                 raise
-        sys.stdout.buffer.write(len(audio).to_bytes(4, "big") + audio)
+        sys.stdout.buffer.write(len(audio).to_bytes(4, 'big') + audio)
     except Exception:
-        sys.stdout.buffer.write((0xFFFFFFFF).to_bytes(4, "big"))
+        sys.stdout.buffer.write((0xFFFFFFFF).to_bytes(4, 'big'))
     sys.stdout.buffer.flush()
-"""
+'''
 
 
 class _EdgeTtsWorker:
@@ -822,16 +868,44 @@ class _EdgeTtsWorker:
                 raise
 
     def _synth_oneshot(self, text: str, voice: str, timeout: float) -> bytes:
+        # Same provider routing as the persistent worker (edge default,
+        # Hermes text_to_speech_tool for premium/custom providers).
         script = (
-            "import asyncio, sys, edge_tts\n"
+            "import asyncio, json, os, sys\n"
+            "_HERMES_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))\n"
+            "if _HERMES_ROOT not in sys.path: sys.path.insert(0, _HERMES_ROOT)\n"
+            "import edge_tts\n"
+            "def _provider():\n"
+            "    try:\n"
+            "        import yaml\n"
+            "        p = os.path.join(os.path.expanduser('~'), '.hermes', 'config.yaml')\n"
+            "        if os.path.exists(p):\n"
+            "            c = yaml.safe_load(open(p)) or {}\n"
+            "            return ((c.get('tts') or {}).get('provider') or 'edge').lower()\n"
+            "    except Exception: pass\n"
+            "    return 'edge'\n"
+            "def _hermes():\n"
+            "    import tempfile\n"
+            "    from tools.tts_tool import text_to_speech_tool\n"
+            "    out = tempfile.mktemp(suffix='.mp3')\n"
+            "    try:\n"
+            "        r = text_to_speech_tool(sys.argv[1], output_path=out)\n"
+            "        d = json.loads(r) if isinstance(r, str) else r\n"
+            "        if d.get('success') and os.path.exists(out):\n"
+            "            return open(out, 'rb').read()\n"
+            "        raise RuntimeError(str(d.get('error') or 'tts failed')[:200])\n"
+            "    finally:\n"
+            "        try: os.unlink(out)\n"
+            "        except Exception: pass\n"
             "async def m():\n"
-            "    tts = edge_tts.Communicate(sys.argv[1], voice=sys.argv[2])\n"
-            "    out = b''\n"
-            "    async for chunk in tts.stream():\n"
-            "        if chunk['type'] == 'audio':\n"
-            "            out += chunk['data']\n"
-            "    sys.stdout.buffer.write(out)\n"
-            "asyncio.run(m())\n"
+            "    if _provider() in ('edge', '', None):\n"
+            "        tts = edge_tts.Communicate(sys.argv[1], voice=sys.argv[2])\n"
+            "        out = b''\n"
+            "        async for chunk in tts.stream():\n"
+            "            if chunk['type'] == 'audio': out += chunk['data']\n"
+            "        return out\n"
+            "    return _hermes()\n"
+            "sys.stdout.buffer.write(asyncio.run(m()))\n"
         )
         proc = subprocess.run(
             [self._venv_py, "-c", script, text, voice],

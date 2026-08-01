@@ -86,10 +86,23 @@ No Tailscale? Cloudflare tunnel is the automatic fallback (kept fresh by the sup
 | `AI_BASE_URL` | `http://localhost:20128/v1` | OpenAI-compatible API base |
 | `AI_MODEL` | `auto/best-coding` | Active model |
 | `TTS_VOICE` | `en-IN-NeerjaNeural` | Default edge-tts voice |
+| `BRIDGE_AUTO_UPDATE` | `1` | Auto-update plugin + server on `mobile-serve` (set `0` to disable) |
 | `CAVEMAN_STYLE` | `1` | Caveman style replies (set `0` to disable) |
 | `CONTEXT_RECENT_K` | `24` | Verbatim recent-message window (headroom) |
 | `CONTEXT_SUMMARY_BATCH` | `12` | Older messages rolled into the summary |
 | `STORE_PATH` | `~/.hermes-mobile-server` | Messages / cache / QR data |
+
+## TTS provider routing
+
+The bridge's `/api/tts` follows **Hermes' TTS config** (`~/.hermes/config.yaml` → `tts:`):
+
+- **`tts.provider` unset or `edge`** (default) → built-in edge-tts with the app's
+  9-language voice selector (`en-IN-NeerjaNeural`, `hi-IN-SwaraNeural`, …)
+- **`tts.provider` set to anything else** (`elevenlabs`, `openai`, `xai`, `minimax`,
+  `gemini`, `mistral`, `deepinfra`, `piper`, `neutts`, `kittentts`, or a custom
+  `type: command` provider) → synthesis is delegated to Hermes' own
+  `text_to_speech_tool`, so premium voices work by configuring Hermes normally.
+  Unknown providers fall back to edge inside Hermes' tool (fail-open).
 
 ## Security
 
