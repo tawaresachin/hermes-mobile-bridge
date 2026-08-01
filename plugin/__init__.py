@@ -13,13 +13,28 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
+
+# ─── Bootstrap: make platform_utils importable ──────────────────────────
+# The plugin ships INSIDE the bridge repo (plugin/__init__.py), so the repo
+# root is our parent — whether installed by symlink, by copy inside the repo,
+# or as the legacy standalone ~/hermes-mobile-server layout.
+def _ensure_platform_utils() -> None:
+    for cand in (Path(__file__).resolve().parent.parent, Path.home() / "hermes-mobile-server"):
+        if (cand / "platform_utils.py").exists():
+            sp = str(cand)
+            if sp not in sys.path:
+                sys.path.insert(0, sp)
+            return
+
+_ensure_platform_utils()
+import platform_utils  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -42,21 +57,59 @@ def _setup_parser(subparser) -> None:
     )
 
 
+def _ensure_forced_defaults(bridge_dir: Path) -> None:
+    """Force token-saving defaults at setup: caveman style + context headroom.
+
+    Written into the bridge's .env so every conversation, on every restart,
+    keeps replies short and context compact (rolling summary) — the user
+    should never have to opt in per-session."""
+    env_path = bridge_dir / ".env"
+    defaults = {
+        "CAVEMAN_STYLE": "1",          # short caveman replies — fewer tokens
+        "CONTEXT_RECENT_K": "24",      # verbatim recent-message window
+        "CONTEXT_SUMMARY_BATCH": "12", # older messages roll into the summary
+    }
+    try:
+        existing: dict[str, str] = {}
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if "=" in line and not line.strip().startswith("#"):
+                    k, _, v = line.partition("=")
+                    existing[k.strip()] = v.strip()
+        changed = False
+        for k, v in defaults.items():
+            if existing.get(k) != v:
+                existing[k] = v
+                changed = True
+        if changed:
+            lines = [f"{k}={v}" for k, v in existing.items()]
+            env_path.write_text("\n".join(lines) + "\n")
+            logger.info("Forced defaults written to %s: %s", env_path.name, ", ".join(defaults))
+    except Exception as e:
+        logger.warning("Could not write forced defaults to %s: %s", env_path, e)
+
+
 def _start_server(port: int, host: str, omniroute: bool) -> None:
-    """Start the Hermes Mobile Bridge server."""
-    bridge_dir = Path(__file__).resolve().parent.parent.parent.parent / "hermes-mobile-server"
+    """Start the Hermes Mobile Bridge server (cross-platform)."""
+    # Smart bridge dir resolution: the plugin ships INSIDE the bridge repo
+    # (plugin/__init__.py), so prefer the repo next to us; fall back to the
+    # legacy ~/hermes-mobile-server location for copy-installs.
+    repo_root = Path(__file__).resolve().parent.parent
+    bridge_dir = repo_root if (repo_root / "server.py").exists() else Path.home() / "hermes-mobile-server"
     if not bridge_dir.exists():
-        bridge_dir = Path.home() / "hermes-mobile-server"
-    if not bridge_dir.exists():
-        print("⚠ Bridge server not found at ~/hermes-mobile-server/")
-        print("   Clone it: git clone https://github.com/tawaresachin/hermes-mobile-bridge.git")
+        print("⚠ Bridge server not found. Clone: git clone https://github.com/tawaresachin/hermes-mobile-bridge")
         return
 
-    print(f"🤖 Hermes Mobile Bridge starting on http://{host}:{port}")
+    os_name = platform_utils.detect_os()
+    print(f"🤖 Hermes Mobile Bridge ({os_name}) starting on http://{host}:{port}")
 
     if omniroute:
         _ensure_omnirouter()
     ts_ip = _ensure_tailscale()
+
+    # Forced defaults (caveman + context headroom) are persisted at setup so
+    # they survive restarts and apply to every conversation automatically.
+    _ensure_forced_defaults(bridge_dir)
 
     # Build env AFTER lifecycle setup so generated keys propagate to the subprocess
     env = os.environ.copy()
@@ -64,6 +117,9 @@ def _start_server(port: int, host: str, omniroute: bool) -> None:
     env["AI_MODEL"] = env.get("AI_MODEL", "auto/best-coding")
     env["HOST"] = host
     env["PORT"] = str(port)
+    env["CAVEMAN_STYLE"] = env.get("CAVEMAN_STYLE", "1")
+    env["CONTEXT_RECENT_K"] = env.get("CONTEXT_RECENT_K", "24")
+    env["CONTEXT_SUMMARY_BATCH"] = env.get("CONTEXT_SUMMARY_BATCH", "12")
 
     if ts_ip:
         print(f"   🖧 Tailscale: {ts_ip}")
@@ -72,22 +128,85 @@ def _start_server(port: int, host: str, omniroute: bool) -> None:
     print(f"   AI: {env['AI_MODEL']} @ {env['AI_BASE_URL']}")
     print(f"   Plugin: ~/.hermes/plugins/mobile-bridge/")
 
+    # Start the Cloudflare tunnel supervisor (auto-restart + URL tracking)
+    _ensure_tunnel_supervisor(port, bridge_dir)
+
+    # Pick a python that has the server's deps. The hermes venv may lack
+    # bcrypt/qrcode even though the system python3 has everything.
+    server_python = _pick_server_python()
+    print(f"   Server interpreter: {server_python}")
+
     subprocess.run(
-        ["/data/data/com.termux/files/usr/bin/python3", "-B", "server.py"],
+        [server_python, "-B", "server.py"],
         cwd=str(bridge_dir),
         env=env,
     )
 
 
+def _pick_server_python() -> str:
+    """Return a python3 that can import the bridge server's dependencies
+    (OS-aware: Windows py launcher / macOS Homebrew / Termux)."""
+    return platform_utils.pick_server_python()
+
+
+def _ensure_tunnel_supervisor(port: int, bridge_dir: Path) -> None:
+    """Auto-lifecycle for the Cloudflare quick tunnel (cross-platform):
+    start the supervisor in the background if it isn't already running.
+    It kills stale cloudflared instances, restarts on crash, and keeps
+    .current_tunnel_url fresh so the app's refresh always gets a live URL."""
+    # Already running? Portable check via the supervisor's pidfile + os.kill
+    # (pgrep doesn't exist on Windows).
+    pidfile = bridge_dir / ".tunnel_supervisor.pid"
+    try:
+        if pidfile.exists():
+            pid = int(pidfile.read_text().strip())
+            os.kill(pid, 0)  # raises if dead
+            logger.info("Tunnel supervisor already running (pid %s)", pid)
+            return
+    except (ValueError, ProcessLookupError, PermissionError, OSError):
+        pass  # stale pidfile → respawn below
+
+    sup_path = bridge_dir / "tunnel_supervisor.py"
+    if not sup_path.exists():
+        logger.warning("tunnel_supervisor.py not found in %s", bridge_dir)
+        return
+
+    try:
+        popen_kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if platform_utils.detect_os() == "windows":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        else:
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(
+            [sys.executable, "-B", str(sup_path), "--port", str(port)],
+            cwd=str(bridge_dir),
+            **popen_kwargs,
+        )
+        # Write a pidfile so the "already running" check works everywhere.
+        try:
+            pidfile.write_text(str(proc.pid))
+        except Exception:
+            pass
+        logger.info("Tunnel supervisor started (pid %s)", proc.pid)
+    except Exception as e:
+        logger.warning("Failed to start tunnel supervisor: %s", e)
+
+
 def _ensure_omnirouter() -> None:
-    """Auto-lifecycle for OmniRoute: install -> start -> configure."""
+    """Auto-lifecycle for OmniRoute: install -> start -> configure
+    (OS-aware binary download; falls back to npm when present)."""
     or_url = "http://localhost:20128/v1"
     or_key = os.environ.get("HERMES_CUSTOM_LOCALHOST_20128_API_KEY", "") or \
              os.environ.get("OMNIROUTE_API_KEY", "")
 
     or_bin = shutil.which("omniroute")
     if not or_bin:
-        logger.info("OmniRoute not found — installing via npm...")
+        try:
+            or_bin = platform_utils.omniroute_bin()
+        except Exception as e:
+            logger.warning("OmniRoute binary unavailable: %s", e)
+    if not or_bin:
+        logger.info("OmniRoute not found — trying npm install...")
         try:
             subprocess.run(["npm", "install", "-g", "omniroute"],
                            capture_output=True, timeout=120)
@@ -148,71 +267,54 @@ def _ensure_omnirouter() -> None:
 
 
 def _ensure_tailscale() -> str:
-    """Ensure Tailscale on the bridge device: detect → auto-install APK → guide.
-    Returns the Tailscale IP or empty string."""
-    ts_bin = shutil.which("tailscale")
+    """Ensure Tailscale on the bridge device (OS-aware):
+    Android → app-mode detection + auto-install APK;
+    Linux/macOS/Windows → CLI detection (`tailscale ip -4`), else install hint.
+    Returns the Tailscale IP or empty string (Cloudflare tunnel fallback)."""
+    os_name = platform_utils.detect_os()
+    ts_bin = platform_utils.tailscale_bin()
     ts_ip = ""
 
-    # 1. Detect Tailscale IP from network interfaces (Android app mode — no CLI needed)
-    ts_ip = _detect_tailscale_ip()
-    if ts_ip:
-        return ts_ip
+    # 1. Android app mode — no CLI needed (netlink needs root on Android 14)
+    if os_name == "android":
+        ts_ip = platform_utils.tailscale_ip(None)
+        if ts_ip:
+            return ts_ip
+        if not _is_tailscale_app_installed():
+            _auto_install_tailscale_app()
+        ts_ip = platform_utils.tailscale_ip(None)
+        if ts_ip:
+            logger.info("Tailscale active after setup: %s", ts_ip)
+            return ts_ip
+    else:
+        # 2. Desktop CLI: `tailscale ip -4` (Linux/macOS/Windows)
+        ts_ip = platform_utils.tailscale_ip(ts_bin)
+        if ts_ip:
+            logger.info("Tailscale: %s", ts_ip)
+            return ts_ip
+        # 3. Not installed — give the per-OS install hint, keep tunnel fallback
+        _print_tailscale_hint(os_name)
 
-    # 2. Try CLI
-    if ts_bin:
-        try:
-            result = subprocess.run(
-                [ts_bin, "ip", "-4"], capture_output=True, text=True, timeout=5,
-            )
-            ip = result.stdout.strip()
-            if ip and ip.startswith("100."):
-                logger.info("Tailscale: %s", ip)
-                return ip
-        except Exception:
-            pass
+    return ""
 
-    # 3. Auto-install the Tailscale Android app (APK) if missing
-    if not _is_tailscale_app_installed():
-        _auto_install_tailscale_app()
 
-    # 4. Re-check after install attempt
-    ts_ip = _detect_tailscale_ip()
-    if ts_ip:
-        logger.info("Tailscale active after setup: %s", ts_ip)
-        return ts_ip
-
-    # 5. Not available — guide user
+def _print_tailscale_hint(os_name: str) -> None:
+    hints = {
+        "linux": "sudo apt install tailscale   # or: curl -fsSL https://tailscale.com/install.sh | sh",
+        "macos": "brew install tailscale       # then: open -a Tailscale and sign in",
+        "windows": "winget install Tailscale.Tailscale   # or Microsoft Store",
+        "android": "Install the Tailscale app from Play Store / F-Droid and sign in",
+    }
     print()
     print("  ╔══════════════════════════════════════════════════════════╗")
     print("  ║  Tailscale not active                                     ║")
-    print("  ║                                                           ║")
-    print("  ║  1. Install the Tailscale app (auto-attempted) or from    ║")
-    print("  ║     Play Store / F-Droid.                                 ║")
-    print("  ║  2. Open the app and sign in (same account as phone).     ║")
-    print("  ║  3. Restart 'hermes mobile-serve'.                        ║")
-    print("  ║                                                           ║")
-    print("  ║  Until then: Cloudflare tunnel is used as fallback.       ║")
+    print(f"  ║  {hints.get(os_name, 'Install Tailscale')!s:<45}║")
+    print("  ║  Sign in with the SAME account as the phone.             ║")
+    print("  ║  Then restart 'hermes mobile-serve'.                     ║")
+    print("  ║  Until then: Cloudflare tunnel is used as fallback.      ║")
     print("  ╚══════════════════════════════════════════════════════════╝")
     print()
     logger.info("Tailscale not active — using Cloudflare tunnel fallback")
-
-    return ts_ip
-
-
-def _detect_tailscale_ip() -> str:
-    """Look for a 100.x Tailscale IP on any network interface."""
-    try:
-        result = subprocess.run(
-            ["ip", "addr"], capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.splitlines():
-            if "100." in line and "inet " in line:
-                match = re.search(r"inet (100\.\d+\.\d+\.\d+)", line)
-                if match:
-                    return match.group(1)
-    except Exception:
-        pass
-    return ""
 
 
 def _is_tailscale_app_installed() -> bool:

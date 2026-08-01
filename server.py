@@ -16,7 +16,6 @@ import mimetypes
 import os
 import re
 import secrets
-import select
 import shutil
 import subprocess
 import sys
@@ -776,18 +775,25 @@ class _EdgeTtsWorker:
         self._w = None
 
     def _read_exact(self, n: int, timeout: float) -> bytes:
-        assert self._r is not None, "worker not spawned"
+        r = self._r
+        assert r is not None, "worker not spawned"
+        # Thread-based read with timeout — works on Windows too
+        # (select() on pipes is POSIX-only).
+        from concurrent.futures import ThreadPoolExecutor
         buf = b""
         deadline = time.monotonic() + timeout
-        while len(buf) < n:
-            remaining = max(0.1, deadline - time.monotonic())
-            ready, _, _ = select.select([self._r], [], [], remaining)
-            if not ready:
-                raise TimeoutError("TTS worker read timeout")
-            chunk = os.read(self._r.fileno(), n - len(buf))
-            if not chunk:
-                raise EOFError("TTS worker closed")
-            buf += chunk
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            while len(buf) < n:
+                remaining = max(0.1, deadline - time.monotonic())
+                try:
+                    chunk = pool.submit(
+                        lambda: os.read(r.fileno(), n - len(buf))
+                    ).result(timeout=remaining)
+                except Exception:
+                    raise TimeoutError("TTS worker read timeout") from None
+                if not chunk:
+                    raise EOFError("TTS worker closed")
+                buf += chunk
         return buf
 
     def synth(self, text: str, voice: str, timeout: float = 60.0) -> bytes:
