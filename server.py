@@ -655,19 +655,28 @@ CLAIM_TTL = 900  # 15 minutes
 def _issue_claim(user_id: int) -> str:
     token = secrets.token_urlsafe(24)
     with _claim_lock:
-        _claim_tokens[token] = {"user_id": user_id, "expires": time.time() + CLAIM_TTL}
+        # Opportunistic purge of expired entries (bounds memory).
+        now = time.time()
+        expired = [t for t, e in _claim_tokens.items() if e["expires"] < now]
+        for t in expired:
+            _claim_tokens.pop(t, None)
+        _claim_tokens[token] = {"user_id": user_id, "expires": now + CLAIM_TTL}
     return token
 
 
-def _consume_claim(token: str) -> Optional[int]:
-    """Validate + consume a claim token. Returns the user_id or None."""
+def _validate_claim(token: str) -> Optional[int]:
+    """Validate a claim token WITHOUT consuming it.
+
+    Multi-use until expiry (15 min): the user may re-scan the same QR after
+    logging out — it always signs back into the SAME registered account.
+    The token is bound to a user id and time-boxed, so replay within the
+    window only ever re-authenticates that user (same exposure as the
+    password, minus the 15-minute limit)."""
     if not token:
         return None
     with _claim_lock:
-        entry = _claim_tokens.pop(token, None)
-    if not entry:
-        return None
-    if entry["expires"] < time.time():
+        entry = _claim_tokens.get(token)
+    if not entry or entry["expires"] < time.time():
         return None
     return entry["user_id"]
 
@@ -726,10 +735,11 @@ class ClaimRequest(BaseModel):
 
 @app.post("/auth/claim")
 async def auth_claim(body: ClaimRequest):
-    """Exchange a one-time claim token (from the pairing QR) for a JWT.
-    Single-use; expires after 15 minutes. Lets the app sign in as the user
+    """Exchange a claim token (from the pairing QR) for a JWT.
+    Reusable until its 15-minute expiry, so re-scanning after logout signs
+    back into the SAME registered account. Lets the app sign in as the user
     who registered on the web setup page — without ever carrying a password."""
-    user_id = _consume_claim(body.token)
+    user_id = _validate_claim(body.token)
     if user_id is None:
         raise HTTPException(status_code=401, detail="Invalid or expired claim token")
     row = auth_db._get_conn().execute(
