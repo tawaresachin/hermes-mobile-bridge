@@ -326,6 +326,13 @@ def load_messages(session_id: str) -> list[dict]:
 
 
 def save_messages(session_id: str, msgs: list[dict]) -> None:
+    # Memory + disk bound: keep only the most recent N messages per session.
+    # Older turns already rolled into the agent's rolling summary, and the
+    # app's chat view shows recent history — trimming caps per-request
+    # load_messages() cost (read + parse + rewrite was O(n) and unbounded).
+    MAX_STORED_MESSAGES = 300
+    if len(msgs) > MAX_STORED_MESSAGES:
+        msgs = msgs[-MAX_STORED_MESSAGES:]
     _messages_path(session_id).write_text(json.dumps(msgs, indent=2, default=str))
 
 
@@ -1490,9 +1497,29 @@ async def upload_file(
             dest_path = (session_upload_dir / f"{stem}_{counter}{ext}").resolve()
             counter += 1
 
-    # Save the file
-    content = await file.read()
-    dest_path.write_bytes(content)
+    # Save the file — streamed in chunks with a size cap so a huge upload
+    # can never balloon memory (whole-file read would double it in RAM).
+    MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
+    written = 0
+    try:
+        with dest_path.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1 MB at a time
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_SIZE:
+                    out.close()
+                    dest_path.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail="File exceeds 50 MB limit")
+                out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception:
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="Upload failed")
+    finally:
+        await file.close()
 
     # Determine MIME type
     mime_type, _ = mimetypes.guess_type(safe_filename)
@@ -1501,7 +1528,7 @@ async def upload_file(
     logger.info(
         "Uploaded file %s (%d bytes, %s) for session %s",
         safe_filename,
-        len(content),
+        written,
         mime_type,
         session_id,
     )
