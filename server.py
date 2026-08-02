@@ -31,7 +31,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, Depends, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 
@@ -571,7 +571,7 @@ async def verify_bearer(request: Request) -> dict:
 
 
 # Public endpoints that don't require auth
-PUBLIC_PATHS = {"/health", "/diag", "/auth/register", "/auth/login", "/auth/refresh", "/setup/qr", "/setup/connect"}
+PUBLIC_PATHS = {"/health", "/diag", "/auth/register", "/auth/login", "/auth/refresh", "/setup", "/setup/qr", "/setup/connect"}
 
 
 @app.middleware("http")
@@ -1565,6 +1565,78 @@ async def download_apk():
 SETUP_TOKEN = os.getenv("SETUP_TOKEN") or secrets.token_urlsafe(12)
 
 
+SETUP_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes Mobile Bridge — Pair your app</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: radial-gradient(1200px 600px at 50% -10%, #1b1038 0%, #0a0618 55%, #050310 100%);
+    min-height: 100vh; color: #e8e6f5; display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .card {
+    background: rgba(20, 14, 44, 0.75); border: 1px solid rgba(140, 90, 255, 0.25);
+    border-radius: 20px; padding: 36px 32px; max-width: 430px; width: 100%;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.55); backdrop-filter: blur(8px);
+  }
+  h1 { font-size: 22px; font-weight: 700; letter-spacing: 0.2px; }
+  .sub { color: #a99fd6; font-size: 14px; margin-top: 6px; margin-bottom: 24px; }
+  .qr-wrap {
+    background: #fff; border-radius: 16px; padding: 14px; width: 252px; height: 252px;
+    margin: 0 auto 24px; display: flex; align-items: center; justify-content: center;
+  }
+  .qr-wrap img { width: 224px; height: 224px; image-rendering: pixelated; }
+  ol { margin: 0 0 22px 18px; font-size: 14px; line-height: 1.9; color: #cfc9ec; }
+  .info {
+    background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px; padding: 12px 14px; font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 12.5px; word-break: break-all; color: #b9b0e0; margin-bottom: 20px;
+  }
+  .info b { color: #d8d3f5; font-weight: 600; }
+  .btn {
+    display: block; width: 100%; text-align: center; text-decoration: none;
+    background: linear-gradient(135deg, #8a3bff, #5b21d6); color: #fff; font-weight: 600;
+    padding: 13px; border-radius: 12px; font-size: 15px; border: 0; cursor: pointer;
+  }
+  .btn:hover { filter: brightness(1.12); }
+  .hint { text-align: center; color: #7d74a8; font-size: 12.5px; margin-top: 14px; }
+  .err { color: #ff8f8f; text-align: center; padding: 40px 0; font-size: 15px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>🐝 Hermes Mobile Bridge</h1>
+    <div class="sub">Pair your app with this server</div>
+    <div class="qr-wrap"><img src="/setup/qr?token={token}" alt="Pairing QR code"></div>
+    <ol>
+      <li>Open <b>Hermes</b> app on your phone</li>
+      <li>Go to <b>Settings → Add Connection</b></li>
+      <li>Tap <b>Scan QR code</b> and point at this screen</li>
+      <li>Done — the app auto-configures host, API key &amp; token</li>
+    </ol>
+    <div class="info"><b>Server</b> {base_url}</div>
+    <a class="btn" href="/setup/qr?token={token}" download="hermes-connect.png">Download QR</a>
+    <div class="hint">QR encodes the setup token — it rotates on server restart.</div>
+  </div>
+</body>
+</html>"""
+
+
+@app.get("/setup")
+async def setup_page(request: Request, token: str = ""):
+    """Styled HTML page that DISPLAYS the pairing QR code (in-browser UI)."""
+    if not (hmac.compare_digest(token, SETUP_TOKEN) or _is_authorized(request)):
+        raise HTTPException(status_code=401, detail="Invalid setup token")
+    base_url = str(request.base_url).rstrip("/")
+    page = SETUP_PAGE_HTML.replace("{token}", token or SETUP_TOKEN).replace("{base_url}", base_url)
+    return HTMLResponse(page)
+
+
 @app.get("/setup/qr")
 async def setup_qr(request: Request, token: str = ""):
     """Return a QR code PNG that the mobile app scans to auto-configure."""
@@ -1939,6 +2011,7 @@ if __name__ == "__main__":
     print(f"   Store: {STORE_PATH}")
     try:
         _setup_ip = _detect_host_ip()
+        print(f"📱 Pairing page: http://{_setup_ip}:{PORT}/setup?token={SETUP_TOKEN}")
         print(f"📱 App setup: http://{_setup_ip}:{PORT}/setup/connect?token={SETUP_TOKEN}")
         print(f"📱 Scan QR:   http://{_setup_ip}:{PORT}/setup/qr?token={SETUP_TOKEN}")
     except Exception:
