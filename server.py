@@ -642,22 +642,46 @@ def _auth_rate_limited(request: Request) -> bool:
 
 # ─── One-time account claim tokens (QR pairing → sign in as the user) ───
 # After registering/logging in on the web setup page, the server issues a
-# short-lived, single-use token. The page shows a QR containing it; the app
-# scans and exchanges it for a JWT for THAT user — never a password in QR.
+# short-lived token. The page shows a QR containing it; the app scans and
+# exchanges it for a JWT for THAT user — never a password in QR.
+# Tokens are PERSISTED to disk so a server restart (or the 15-min TTL) can't
+# silently invalidate a QR the user is about to scan.
 _claim_tokens: dict[str, dict] = {}
 _claim_lock = threading.Lock()
-CLAIM_TTL = 900  # 15 minutes
+CLAIM_TTL = 900  # 15 minutes (user preference — not longer)
+_CLAIMS_FILE = STORE_PATH / "claims.json"
+
+
+def _claims_save() -> None:
+    try:
+        _CLAIMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _CLAIMS_FILE.write_text(json.dumps(_claim_tokens))
+    except Exception:
+        pass  # best-effort; in-memory still works for the session
+
+
+def _claims_load() -> None:
+    global _claim_tokens
+    try:
+        if _CLAIMS_FILE.exists():
+            _claim_tokens = json.loads(_CLAIMS_FILE.read_text()) or {}
+            # Drop anything already expired.
+            now = time.time()
+            _claim_tokens = {t: e for t, e in _claim_tokens.items() if e.get("expires", 0) > now}
+    except Exception:
+        _claim_tokens = {}
 
 
 def _issue_claim(user_id: int) -> str:
     token = secrets.token_urlsafe(24)
     with _claim_lock:
-        # Opportunistic purge of expired entries (bounds memory).
+        # Opportunistic purge of expired entries (bounds memory + disk).
         now = time.time()
         expired = [t for t, e in _claim_tokens.items() if e["expires"] < now]
         for t in expired:
             _claim_tokens.pop(t, None)
         _claim_tokens[token] = {"user_id": user_id, "expires": now + CLAIM_TTL}
+        _claims_save()
     return token
 
 
@@ -668,7 +692,7 @@ def _validate_claim(token: str) -> Optional[int]:
     logging out — it always signs back into the SAME registered account.
     The token is bound to a user id and time-boxed, so replay within the
     window only ever re-authenticates that user (same exposure as the
-    password, minus the 15-minute limit)."""
+    password, minus the time limit)."""
     if not token:
         return None
     with _claim_lock:
@@ -2080,6 +2104,8 @@ async def start_discovery():
 @app.on_event("startup")
 async def on_startup():
     await start_discovery()
+    # Load persisted claim tokens so pairing QRs survive restarts.
+    _claims_load()
     # Load the persisted models cache so the app's model picker is instant
     # after a server restart, then warm it in the background.
     _models_load_from_disk()
