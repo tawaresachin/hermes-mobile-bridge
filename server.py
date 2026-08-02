@@ -1685,28 +1685,12 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
   }
   h1 { font-size: 22px; font-weight: 700; letter-spacing: 0.2px; }
   .sub { color: #a99fd6; font-size: 14px; margin-top: 6px; margin-bottom: 24px; }
-  .qr-wrap {
-    background: #fff; border-radius: 16px; padding: 14px; width: 252px; height: 252px;
-    margin: 0 auto 24px; display: flex; align-items: center; justify-content: center;
+  .step { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+  .step-num {
+    width: 26px; height: 26px; border-radius: 50%; background: linear-gradient(135deg, #8a3bff, #5b21d6);
+    color: #fff; font-weight: 700; font-size: 14px; display: flex; align-items: center; justify-content: center;
   }
-  .qr-wrap img { width: 224px; height: 224px; image-rendering: pixelated; }
-  ol { margin: 0 0 22px 18px; font-size: 14px; line-height: 1.9; color: #cfc9ec; }
-  .info {
-    background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 12px; padding: 12px 14px; font-family: ui-monospace, Menlo, Consolas, monospace;
-    font-size: 12.5px; word-break: break-all; color: #b9b0e0; margin-bottom: 20px;
-  }
-  .info b { color: #d8d3f5; font-weight: 600; }
-  .btn, .btn2 {
-    display: block; width: 100%; text-align: center; text-decoration: none;
-    background: linear-gradient(135deg, #8a3bff, #5b21d6); color: #fff; font-weight: 600;
-    padding: 13px; border-radius: 12px; font-size: 15px; border: 0; cursor: pointer;
-  }
-  .btn2 { background: linear-gradient(135deg, #1f8f6b, #14684d); margin-top: 10px; }
-  .btn:hover, .btn2:hover { filter: brightness(1.12); }
-  .hint { text-align: center; color: #7d74a8; font-size: 12.5px; margin-top: 14px; }
-  hr { border: 0; border-top: 1px solid rgba(255,255,255,0.09); margin: 26px 0 20px; }
-  .form-title { font-size: 15px; font-weight: 600; margin-bottom: 14px; }
+  .step-label { font-size: 15px; font-weight: 600; }
   .field { margin-bottom: 12px; }
   .field label { display: block; font-size: 12.5px; color: #a99fd6; margin-bottom: 6px; }
   .field input {
@@ -1714,79 +1698,115 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
     background: rgba(0,0,0,0.35); color: #e8e6f5; font-size: 14px; outline: none;
   }
   .field input:focus { border-color: #8a3bff; }
+  .btn {
+    display: block; width: 100%; text-align: center; background: linear-gradient(135deg, #8a3bff, #5b21d6);
+    color: #fff; font-weight: 600; padding: 13px; border-radius: 12px; font-size: 15px; border: 0; cursor: pointer; margin-top: 4px;
+  }
+  .btn:hover { filter: brightness(1.12); }
+  .link { text-align: center; color: #8a3bff; font-size: 13.5px; margin-top: 14px; cursor: pointer; background: none; border: 0; width: 100%; }
+  .link:hover { text-decoration: underline; }
   .msg { font-size: 13px; margin-top: 12px; text-align: center; min-height: 18px; }
   .msg.ok { color: #5ce0a8; }
   .msg.err { color: #ff8f8f; }
+  .qr-wrap {
+    background: #fff; border-radius: 16px; padding: 14px; width: 252px; height: 252px;
+    margin: 0 auto 24px; display: flex; align-items: center; justify-content: center;
+  }
+  .qr-wrap img { width: 224px; height: 224px; image-rendering: pixelated; }
+  .ok-email { text-align: center; color: #5ce0a8; font-weight: 600; margin-bottom: 18px; word-break: break-all; }
+  .info {
+    background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px; padding: 12px 14px; font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 12.5px; word-break: break-all; color: #b9b0e0; margin-bottom: 20px;
+  }
+  ol { margin: 0 0 8px 18px; font-size: 14px; line-height: 1.9; color: #cfc9ec; }
+  .hint { text-align: center; color: #7d74a8; font-size: 12.5px; margin-top: 14px; }
 </style>
 </head>
 <body>
   <div class="card">
     <h1>🐝 Hermes Mobile Bridge</h1>
-    <div class="sub">Pair your phone app — quick connect</div>
-    <div class="qr-wrap"><img id="qr" src="/setup/qr?token={token}" alt="Pairing QR code"></div>
-    <ol>
-      <li>Open <b>Hermes</b> app on your phone</li>
-      <li>Go to <b>Settings → Add Connection</b></li>
-      <li>Tap <b>Scan QR code</b> and point at this screen</li>
-      <li>Done — the app auto-configures and registers a device account</li>
-    </ol>
-    <div class="info"><b>Server</b> {base_url}</div>
-    <a class="btn" href="/setup/qr?token={token}" download="hermes-connect.png">Download QR</a>
-    <div class="hint">QR encodes the setup token — it rotates on server restart.</div>
+    <div class="sub">Set up your phone app — 2 steps</div>
 
-    <hr>
+    <!-- STEP 1: account (shown first) -->
+    <div id="step1">
+      <div class="step"><div class="step-num">1</div><div class="step-label" id="step1title">Create your account</div></div>
+      <form id="regform" autocomplete="off">
+        <div class="field">
+          <label for="email">Email</label>
+          <input type="email" id="email" name="email" required placeholder="you@example.com" autocomplete="email">
+        </div>
+        <div class="field">
+          <label for="pw">Password (min 8 characters)</label>
+          <input type="password" id="pw" name="pw" required minlength="8" placeholder="••••••••" autocomplete="new-password">
+        </div>
+        <div class="field" id="pw2field">
+          <label for="pw2">Confirm password</label>
+          <input type="password" id="pw2" name="pw2" required minlength="8" placeholder="••••••••" autocomplete="new-password">
+        </div>
+        <button type="submit" class="btn" id="actbtn">Create account</button>
+        <button type="button" class="link" id="togbtn">Already registered? Log in</button>
+      </form>
+      <div class="msg" id="msg1"></div>
+      <div class="info" style="margin-top:16px"><b>Server</b> {base_url}</div>
+    </div>
 
-    <div class="form-title">Create an account (optional — for the app's login form)</div>
-    <form id="regform" autocomplete="off">
-      <div class="field">
-        <label for="email">Email</label>
-        <input type="email" id="email" name="email" required placeholder="you@example.com" autocomplete="email">
-      </div>
-      <div class="field">
-        <label for="pw">Password (min 8 characters)</label>
-        <input type="password" id="pw" name="pw" required minlength="8" placeholder="••••••••" autocomplete="new-password">
-      </div>
-      <div class="field">
-        <label for="pw2">Confirm password</label>
-        <input type="password" id="pw2" name="pw2" required minlength="8" placeholder="••••••••" autocomplete="new-password">
-      </div>
-      <button type="submit" class="btn2" id="regbtn">Create account</button>
-      <div class="msg" id="regmsg"></div>
-    </form>
-    <div class="hint">HTTP private-network note: use a strong, unique password.</div>
+    <!-- STEP 2: claim QR (shown only AFTER account exists) -->
+    <div id="step2" style="display:none">
+      <div class="step"><div class="step-num">2</div><div class="step-label">Scan to connect your phone</div></div>
+      <div class="ok-email" id="okemail"></div>
+      <div class="qr-wrap"><img id="qr" alt="Sign-in QR code"></div>
+      <ol>
+        <li>Open <b>Hermes</b> app on your phone (v2.17.1+)</li>
+        <li>Go to <b>Settings → Add Connection</b></li>
+        <li>Tap <b>Scan QR code</b> and point at this screen</li>
+        <li>Done — the app signs in as your account</li>
+      </ol>
+      <button type="button" class="btn" id="backbtn">← Register / log in another account</button>
+      <div class="msg" id="msg2"></div>
+    </div>
+    <div class="hint">The QR is generated only after your account exists — it contains a one-time sign-in token, never a password.</div>
   </div>
 <script>
+  var PAGE_TOKEN = "{token}";
+  var regMode = true;
+  function showStep(which) {
+    document.getElementById("step1").style.display = (which === 1) ? "block" : "none";
+    document.getElementById("step2").style.display = (which === 2) ? "block" : "none";
+  }
+  document.getElementById("togbtn").addEventListener("click", function () {
+    regMode = !regMode;
+    document.getElementById("step1title").textContent = regMode ? "Create your account" : "Log in";
+    document.getElementById("pw2field").style.display = regMode ? "block" : "none";
+    document.getElementById("actbtn").textContent = regMode ? "Create account" : "Log in";
+    document.getElementById("msg1").className = "msg"; document.getElementById("msg1").textContent = "";
+  });
+  document.getElementById("backbtn").addEventListener("click", function () { showStep(1); });
   document.getElementById("regform").addEventListener("submit", async function (e) {
     e.preventDefault();
     var email = document.getElementById("email").value.trim();
     var pw = document.getElementById("pw").value;
     var pw2 = document.getElementById("pw2").value;
-    var msg = document.getElementById("regmsg");
-    var btn = document.getElementById("regbtn");
-    if (pw !== pw2) { msg.className = "msg err"; msg.textContent = "Passwords do not match"; return; }
-    msg.className = "msg"; msg.textContent = "Creating account…";
+    var msg = document.getElementById("msg1");
+    var btn = document.getElementById("actbtn");
+    if (regMode && pw !== pw2) { msg.className = "msg err"; msg.textContent = "Passwords do not match"; return; }
+    msg.className = "msg"; msg.textContent = "Please wait…";
     btn.disabled = true;
     try {
-      var r = await fetch("/auth/register", {
+      var path = regMode ? "/auth/register" : "/auth/login";
+      var r = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email, password: pw })
       });
       var data = await r.json();
-      if (r.ok) {
-        msg.className = "msg ok";
-        msg.textContent = "Account created ✓ — scan the new QR to sign in as " + email;
-        if (data.claim_token) {
-          var img = document.getElementById("qr");
-          var q = new URLSearchParams(img.getAttribute("src").split("?")[1] || "");
-          img.setAttribute("src", "/setup/qr?token=" + encodeURIComponent(q.get("token")) + "&claim=" + encodeURIComponent(data.claim_token));
-        }
-        document.getElementById("email").value = "";
-        document.getElementById("pw").value = "";
-        document.getElementById("pw2").value = "";
+      if (r.ok && data.claim_token) {
+        document.getElementById("okemail").textContent = "Signed in as " + data.email;
+        document.getElementById("qr").setAttribute("src", "/setup/qr?token=" + encodeURIComponent(PAGE_TOKEN) + "&claim=" + encodeURIComponent(data.claim_token));
+        showStep(2);
       } else {
         msg.className = "msg err";
-        msg.textContent = (data.detail || "Registration failed") + "";
+        msg.textContent = (data.detail || "Request failed") + "";
       }
     } catch (err) {
       msg.className = "msg err";
@@ -1797,6 +1817,7 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
 </script>
 </body>
 </html>"""
+
 
 
 
