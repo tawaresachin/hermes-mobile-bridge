@@ -9,6 +9,7 @@ New in v2: User authentication with JWT + refresh tokens.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import hashlib
 import json
 import logging
@@ -555,8 +556,8 @@ async def verify_bearer(request: Request) -> dict:
             raise HTTPException(status_code=401, detail="Invalid token payload")
         return payload
 
-    # Fallback: check static API key (backward compat)
-    if HERMES_API_KEY and token == HERMES_API_KEY:
+    # Fallback: check static API key (backward compat) — timing-safe
+    if HERMES_API_KEY and hmac.compare_digest(token, HERMES_API_KEY):
         return {"sub": "0", "email": "legacy@api-key", "type": "legacy"}
 
     raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -569,7 +570,9 @@ PUBLIC_PATHS = {"/health", "/diag", "/auth/register", "/auth/login", "/auth/refr
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Skip auth for public paths; enforce for everything else."""
-    if request.url.path in PUBLIC_PATHS or request.url.path.startswith(("/auth/", "/uploads/")):
+    # NOTE: /uploads is intentionally NOT whitelisted — uploaded attachments
+    # (transcripts, images) require auth; the app sends Bearer via Coil.
+    if request.url.path in PUBLIC_PATHS or request.url.path.startswith("/auth/"):
         return await call_next(request)
     # Check auth
     auth = request.headers.get("Authorization", "")
@@ -584,7 +587,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     
     # Fallback: check if it's the static HERMES_API_KEY (backward compat)
-    if HERMES_API_KEY and token == HERMES_API_KEY:
+    if HERMES_API_KEY and hmac.compare_digest(token, HERMES_API_KEY):
         request.state.user = {"sub": "0", "email": "legacy@api-key", "type": "legacy"}
         return await call_next(request)
     
@@ -600,7 +603,26 @@ def _is_authorized(request: Request) -> bool:
     token = auth[7:].strip()
     if decode_access_token(token, JWT_SECRET):
         return True
-    return bool(HERMES_API_KEY and token == HERMES_API_KEY)
+    return bool(HERMES_API_KEY and hmac.compare_digest(token, HERMES_API_KEY))
+
+
+@app.middleware("http")
+async def access_log_middleware(request: Request, call_next):
+    """Structured access log with duration — one line per request.
+    Registered after auth_middleware, so it wraps it (401s are logged too)."""
+    import time as _time
+    start = _time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        raise
+    duration_ms = (_time.perf_counter() - start) * 1000
+    logger.info(
+        "req %s %s -> %d (%.1fms)",
+        request.method, request.url.path, response.status_code, duration_ms,
+    )
+    return response
 
 
 @app.post("/auth/register")
@@ -792,7 +814,11 @@ class _EdgeTtsWorker:
         self._w = self._proc.stdin
         # Raw, unbuffered reader — select() + os.read() need no buffering
         # layer, otherwise buffer/pipe desync would corrupt the protocol.
-        self._r = os.fdopen(self._proc.stdout.fileno(), "rb", buffering=0)
+        # os.dup() gives an INDEPENDENT fd so closing this wrapper can never
+        # invalidate Popen's stdout (avoid "Bad file descriptor" on GC).
+        _out = self._proc.stdout
+        assert _out is not None, "worker stdout pipe missing"
+        self._r = os.fdopen(os.dup(_out.fileno()), "rb", buffering=0)
 
     def _kill(self) -> None:
         if self._proc is not None:
@@ -1262,8 +1288,9 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # Load conversation history
-    openai_messages = _build_openai_messages(session_id)
+    # Load conversation history — off the event loop: attachment reads / OCR
+    # (subprocess, up to 30s) must never block other requests.
+    openai_messages = await asyncio.to_thread(_build_openai_messages, session_id)
 
     # Use session-scoped model override if available
     effective_model = _resolve_model(session_id)
@@ -1369,7 +1396,7 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
         system_prompt=DEFAULT_SYSTEM_PROMPT,
     )
 
-    openai_messages = _build_openai_messages(session_id)
+    openai_messages = await asyncio.to_thread(_build_openai_messages, session_id)
     # List + join: O(n) — string += in a loop is O(n²) for long responses
     response_chunks: list[str] = []
     reasoning_chunks: list[str] = []
@@ -1515,7 +1542,7 @@ SETUP_TOKEN = os.getenv("SETUP_TOKEN") or secrets.token_urlsafe(12)
 async def setup_qr(request: Request, token: str = ""):
     """Return a QR code PNG that the mobile app scans to auto-configure."""
     # Accept: ?token=SETUP_TOKEN (QR pairing) OR valid JWT / bridge key (app session)
-    if not (token == SETUP_TOKEN or _is_authorized(request)):
+    if not (hmac.compare_digest(token, SETUP_TOKEN) or _is_authorized(request)):
         raise HTTPException(status_code=401, detail="Invalid setup token")
     import io
     try:
@@ -1550,7 +1577,7 @@ async def setup_connect(request: Request, token: str = ""):
     (tunnel caller → current live tunnel URL; Tailscale caller → 100.x),
     so a refresh never switches an app to an unreachable address."""
     # Accept: ?token=SETUP_TOKEN (QR pairing) OR valid JWT / bridge key (app session)
-    if not (token == SETUP_TOKEN or _is_authorized(request)):
+    if not (hmac.compare_digest(token, SETUP_TOKEN) or _is_authorized(request)):
         raise HTTPException(status_code=401, detail="Invalid setup token")
 
     # Which route did the caller use to reach us?
