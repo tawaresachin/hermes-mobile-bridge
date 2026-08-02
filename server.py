@@ -1000,33 +1000,82 @@ async def text_to_speech(body: TtsRequest, user: dict = Depends(verify_bearer)):
     return Response(content=audio, media_type="audio/mpeg")
 
 
-# ─── Models cache (module-level, populated lazily) ───
+# ─── Models cache (module-level, disk-persisted + lazy refresh) ───
+# Persisted to disk so a server restart NEVER wipes it: the app's model
+# picker gets an instant answer at startup. When the cache is stale we
+# serve the old list immediately and refresh in the background.
 _models_cache: dict = {}
 _models_cache_ts: float = 0.0
+_models_lock = threading.Lock()
+_MODELS_CACHE_FILE = STORE_PATH / "models_cache.json"
+
+
+def _models_save_to_disk() -> None:
+    try:
+        _MODELS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _MODELS_CACHE_FILE.write_text(json.dumps({"ts": _models_cache_ts, "models": _models_cache}))
+    except Exception as e:
+        logger.warning("models cache save failed: %s", e)
+
+
+def _models_load_from_disk() -> None:
+    global _models_cache, _models_cache_ts
+    try:
+        if _MODELS_CACHE_FILE.exists():
+            data = json.loads(_MODELS_CACHE_FILE.read_text())
+            _models_cache = data.get("models", {}) or {}
+            _models_cache_ts = float(data.get("ts", 0.0))
+            logger.info("Loaded %d models from disk cache", len(_models_cache))
+    except Exception as e:
+        logger.warning("models cache load failed: %s", e)
+
+
+def _refresh_models_background(session_id: str) -> None:
+    """Thread worker: refetch models, update cache + disk. Never blocks a request."""
+    global _models_cache_ts
+    try:
+        result = _fetch_models_sync(session_id)
+        if result:
+            with _models_lock:
+                _models_cache.clear()
+                _models_cache.update(result)
+                _models_cache_ts = time.time()
+            _models_save_to_disk()
+            logger.info("Background model refresh: %d models", len(result))
+    except Exception as e:
+        logger.warning("background model refresh failed: %s", e)
 
 
 @app.get("/api/models")
 async def list_models(session_id: str = "", user: dict = Depends(verify_bearer)):
     """List available models — only from providers we can actually query.
 
-    Runs the (blocking) provider queries on a thread executor so the event
-    loop never freezes, and caches the result for 30 minutes so the app's
-    model picker opens instantly (model lists rarely change).
+    Cache: fresh for 30 min; if stale we SERVE the cached list immediately
+    and refresh in the background (the picker never blocks); only a very
+    first boot with no cache performs a synchronous fetch.
     """
-    import time as _time
     global _models_cache_ts
-    # TTL cache: fresh results for 30 min, then refetch in the background
+    now = time.time()
     cache_ttl = 1800
-    now = _time.time()
-    if now - _models_cache_ts < cache_ttl:
+
+    with _models_lock:
+        if _models_cache and now - _models_cache_ts < cache_ttl:
+            return _models_cache
+
+    # Stale but present: serve now, refresh in the background.
+    if _models_cache:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _refresh_models_background, session_id)
         return _models_cache
 
-    # Offload the blocking provider queries off the event loop
+    # No cache at all (first boot): fetch once, synchronously.
     result = await asyncio.to_thread(_fetch_models_sync, session_id)
-
-    _models_cache.clear()
-    _models_cache.update(result)
-    _models_cache_ts = now
+    if result:
+        with _models_lock:
+            _models_cache.clear()
+            _models_cache.update(result)
+            _models_cache_ts = time.time()
+        _models_save_to_disk()
     return result
 
 
@@ -1679,6 +1728,10 @@ async def start_discovery():
 @app.on_event("startup")
 async def on_startup():
     await start_discovery()
+    # Load the persisted models cache so the app's model picker is instant
+    # after a server restart, then warm it in the background.
+    _models_load_from_disk()
+    asyncio.get_running_loop().run_in_executor(None, _refresh_models_background, "")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────
