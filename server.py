@@ -43,6 +43,7 @@ from auth_handler import (
     get_jwt_secret,
     create_access_token,
     decode_access_token,
+    generate_refresh_token,
     register_user,
     login_user,
     refresh_tokens,
@@ -642,6 +643,35 @@ def _auth_rate_limited(request: Request) -> bool:
         return False
 
 
+# ─── One-time account claim tokens (QR pairing → sign in as the user) ───
+# After registering/logging in on the web setup page, the server issues a
+# short-lived, single-use token. The page shows a QR containing it; the app
+# scans and exchanges it for a JWT for THAT user — never a password in QR.
+_claim_tokens: dict[str, dict] = {}
+_claim_lock = threading.Lock()
+CLAIM_TTL = 900  # 15 minutes
+
+
+def _issue_claim(user_id: int) -> str:
+    token = secrets.token_urlsafe(24)
+    with _claim_lock:
+        _claim_tokens[token] = {"user_id": user_id, "expires": time.time() + CLAIM_TTL}
+    return token
+
+
+def _consume_claim(token: str) -> Optional[int]:
+    """Validate + consume a claim token. Returns the user_id or None."""
+    if not token:
+        return None
+    with _claim_lock:
+        entry = _claim_tokens.pop(token, None)
+    if not entry:
+        return None
+    if entry["expires"] < time.time():
+        return None
+    return entry["user_id"]
+
+
 @app.middleware("http")
 async def access_log_middleware(request: Request, call_next):
     """Structured access log with duration — one line per request.
@@ -671,6 +701,9 @@ async def auth_register(request: Request, body: RegisterRequest):
         result = await register_user(STORE_PATH, body.email, body.password)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # One-time claim token so the web setup page can produce a "sign in as
+    # this user" QR for the app (no password ever goes into a QR).
+    result["claim_token"] = _issue_claim(int(result.get("user_id", 0)))
     return result
 
 
@@ -683,7 +716,38 @@ async def auth_login(request: Request, body: LoginRequest):
     result = await login_user(STORE_PATH, body.email, body.password)
     if not result:
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    result["claim_token"] = _issue_claim(int(result.get("user_id", 0)))
     return result
+
+
+class ClaimRequest(BaseModel):
+    token: str
+
+
+@app.post("/auth/claim")
+async def auth_claim(body: ClaimRequest):
+    """Exchange a one-time claim token (from the pairing QR) for a JWT.
+    Single-use; expires after 15 minutes. Lets the app sign in as the user
+    who registered on the web setup page — without ever carrying a password."""
+    user_id = _consume_claim(body.token)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired claim token")
+    row = auth_db._get_conn().execute(
+        "SELECT email FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="User not found")
+    email = row[0]
+    secret = get_jwt_secret(STORE_PATH)
+    access = create_access_token(user_id, email, secret)
+    refresh_raw, _ = generate_refresh_token()
+    refresh_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
+    auth_db._get_conn().execute(
+        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
+        (refresh_hash, user_id, int(time.time()) + 30 * 86400, int(time.time())),
+    )
+    auth_db._get_conn().commit()
+    return {"token": access, "refresh_token": refresh_raw, "user_id": str(user_id), "email": email}
 
 
 @app.post("/auth/refresh")
@@ -1659,7 +1723,7 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
   <div class="card">
     <h1>🐝 Hermes Mobile Bridge</h1>
     <div class="sub">Pair your phone app — quick connect</div>
-    <div class="qr-wrap"><img src="/setup/qr?token={token}" alt="Pairing QR code"></div>
+    <div class="qr-wrap"><img id="qr" src="/setup/qr?token={token}" alt="Pairing QR code"></div>
     <ol>
       <li>Open <b>Hermes</b> app on your phone</li>
       <li>Go to <b>Settings → Add Connection</b></li>
@@ -1711,7 +1775,12 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
       var data = await r.json();
       if (r.ok) {
         msg.className = "msg ok";
-        msg.textContent = "Account created ✓ — log in with this email in the app";
+        msg.textContent = "Account created ✓ — scan the new QR to sign in as " + email;
+        if (data.claim_token) {
+          var img = document.getElementById("qr");
+          var q = new URLSearchParams(img.getAttribute("src").split("?")[1] || "");
+          img.setAttribute("src", "/setup/qr?token=" + encodeURIComponent(q.get("token")) + "&claim=" + encodeURIComponent(data.claim_token));
+        }
         document.getElementById("email").value = "";
         document.getElementById("pw").value = "";
         document.getElementById("pw2").value = "";
@@ -1742,11 +1811,22 @@ async def setup_page(request: Request, token: str = ""):
 
 
 @app.get("/setup/qr")
-async def setup_qr(request: Request, token: str = ""):
-    """Return a QR code PNG that the mobile app scans to auto-configure."""
+async def setup_qr(request: Request, token: str = "", claim: str = ""):
+    """Return a QR code PNG that the mobile app scans to auto-configure.
+
+    With ?claim=<one-time token> the QR additionally carries the claim so
+    scanning signs the app into the user who registered on the web page."""
     # Accept: ?token=SETUP_TOKEN (QR pairing) OR valid JWT / bridge key (app session)
     if not (hmac.compare_digest(token, SETUP_TOKEN) or _is_authorized(request)):
         raise HTTPException(status_code=401, detail="Invalid setup token")
+    # Validate an optionally provided claim token (must be un-expired).
+    claim_ok = False
+    if claim:
+        with _claim_lock:
+            entry = _claim_tokens.get(claim)
+        claim_ok = bool(entry and entry["expires"] >= time.time())
+        if not claim_ok:
+            raise HTTPException(status_code=401, detail="Invalid or expired claim token")
     import io
     try:
         import qrcode
@@ -1765,6 +1845,8 @@ async def setup_qr(request: Request, token: str = ""):
         else:
             host_ip = ts_ip or "127.0.0.1"
             setup_url = f"hermes://connect?host={host_ip}&port={PORT}&key={HERMES_API_KEY}&setup={SETUP_TOKEN}"
+    if claim_ok:
+        setup_url += f"&claim={claim}"
 
     img = qrcode.make(setup_url, image_factory=PilImage)
     buf = io.BytesIO()
