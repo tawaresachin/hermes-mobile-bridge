@@ -6,7 +6,6 @@ Single file, zero external deps beyond stdlib + bcrypt + jwt.
 from __future__ import annotations
 
 import hashlib
-import os
 import secrets
 import sqlite3
 import time

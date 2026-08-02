@@ -36,10 +36,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 
 # Local auth modules
-from auth_db import get_auth_db, AuthDB
+from auth_db import get_auth_db
 from auth_handler import (
-    hash_password,
-    verify_password,
     get_jwt_secret,
     create_access_token,
     decode_access_token,
@@ -47,7 +45,6 @@ from auth_handler import (
     register_user,
     login_user,
     refresh_tokens,
-    REFRESH_EXPIRE_DAYS,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -685,14 +682,13 @@ def _validate_claim(token: str) -> Optional[int]:
 async def access_log_middleware(request: Request, call_next):
     """Structured access log with duration — one line per request.
     Registered after auth_middleware, so it wraps it (401s are logged too)."""
-    import time as _time
-    start = _time.perf_counter()
+    start = time.perf_counter()
     try:
         response = await call_next(request)
     except Exception:
         logger.exception("Unhandled error on %s %s", request.method, request.url.path)
         raise
-    duration_ms = (_time.perf_counter() - start) * 1000
+    duration_ms = (time.perf_counter() - start) * 1000
     logger.info(
         "req %s %s -> %d (%.1fms)",
         request.method, request.url.path, response.status_code, duration_ms,

@@ -6,14 +6,13 @@ import asyncio
 import json
 import os
 import re
-import time
 import uuid
 from typing import AsyncGenerator, Optional
 
 import httpx
 
 from tools import ToolCall, ToolResult, ToolRegistry, registry
-from hermes_features import handle_command, build_system_prompt, COMMANDS
+from hermes_features import handle_command, build_system_prompt
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "

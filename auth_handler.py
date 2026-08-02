@@ -5,7 +5,6 @@ Re-exports auth_db functions for convenience.
 """
 from __future__ import annotations
 
-import os
 import secrets
 import hashlib
 import time
@@ -15,7 +14,7 @@ from typing import Optional
 import bcrypt
 import jwt
 
-from auth_db import AuthDB, get_auth_db, DB_FILENAME
+from auth_db import get_auth_db
 
 # ─── Constants ───
 
