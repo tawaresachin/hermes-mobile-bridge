@@ -1199,6 +1199,19 @@ def _fetch_models_sync(session_id: str) -> dict:
                 "baseUrl": cp.get("base_url", ""),
             })
 
+    # ── Normalize flags by model id (consistency across providers) ──
+    # The same model can appear from multiple providers (OmniRoute, OpenCode,
+    # OpenRouter, custom). Previously each provider set isFree/isVision its own
+    # way -> the same model showed a "free" badge in one section but not the
+    # other. Single deterministic rule by id: identical id -> identical flags.
+    import re as _re
+    _free_re = _re.compile(r"(^|[/_:.\-])free($|[/_:.\-])", _re.I)
+    _vision_re = _re.compile(r"(vl|vision|multimodal|omni)", _re.I)
+    for m in models:
+        mid = m.get("id", "")
+        m["isFree"] = bool(_free_re.search(mid))
+        m["isVision"] = bool(_vision_re.search(mid)) and not m["isFree"]
+
     # Build base URL + API key maps for provider-aware switching.
     # Keys resolve at runtime from config/env — nothing hardcoded.
     for m in models:
