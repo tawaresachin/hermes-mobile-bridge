@@ -613,6 +613,35 @@ def _is_authorized(request: Request) -> bool:
     return bool(HERMES_API_KEY and hmac.compare_digest(token, HERMES_API_KEY))
 
 
+# ─── Auth rate limiting (brute-force / spam protection) ───
+_auth_attempts: dict[str, list[float]] = {}
+_auth_attempts_lock = threading.Lock()
+AUTH_RATE_LIMIT = 20          # max attempts per window
+AUTH_RATE_WINDOW = 900        # 15 minutes
+
+
+def _client_ip(request: Request) -> str:
+    """Client IP — honour X-Forwarded-For (Cloudflare tunnel) with fallback."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _auth_rate_limited(request: Request) -> bool:
+    """True if the client has exceeded the auth attempt budget."""
+    ip = _client_ip(request)
+    now = time.time()
+    with _auth_attempts_lock:
+        hits = [t for t in _auth_attempts.get(ip, []) if now - t < AUTH_RATE_WINDOW]
+        if len(hits) >= AUTH_RATE_LIMIT:
+            _auth_attempts[ip] = hits
+            return True
+        hits.append(now)
+        _auth_attempts[ip] = hits
+        return False
+
+
 @app.middleware("http")
 async def access_log_middleware(request: Request, call_next):
     """Structured access log with duration — one line per request.
@@ -633,8 +662,11 @@ async def access_log_middleware(request: Request, call_next):
 
 
 @app.post("/auth/register")
-async def auth_register(body: RegisterRequest):
-    """Register a new user. Returns access + refresh tokens."""
+async def auth_register(request: Request, body: RegisterRequest):
+    """Register a new user. Returns access + refresh tokens.
+    Rate-limited per client IP to prevent spam accounts."""
+    if _auth_rate_limited(request):
+        raise HTTPException(status_code=429, detail="Too many attempts — try again later")
     try:
         result = await register_user(STORE_PATH, body.email, body.password)
     except ValueError as e:
@@ -643,8 +675,11 @@ async def auth_register(body: RegisterRequest):
 
 
 @app.post("/auth/login")
-async def auth_login(body: LoginRequest):
-    """Log in with email + password. Returns access + refresh tokens."""
+async def auth_login(request: Request, body: LoginRequest):
+    """Log in with email + password. Returns access + refresh tokens.
+    Rate-limited per client IP to slow brute-force attempts."""
+    if _auth_rate_limited(request):
+        raise HTTPException(status_code=429, detail="Too many attempts — try again later")
     result = await login_user(STORE_PATH, body.email, body.password)
     if not result:
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -1570,7 +1605,7 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hermes Mobile Bridge — Pair your app</title>
+<title>Hermes Mobile Bridge — Setup</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1598,33 +1633,102 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
     font-size: 12.5px; word-break: break-all; color: #b9b0e0; margin-bottom: 20px;
   }
   .info b { color: #d8d3f5; font-weight: 600; }
-  .btn {
+  .btn, .btn2 {
     display: block; width: 100%; text-align: center; text-decoration: none;
     background: linear-gradient(135deg, #8a3bff, #5b21d6); color: #fff; font-weight: 600;
     padding: 13px; border-radius: 12px; font-size: 15px; border: 0; cursor: pointer;
   }
-  .btn:hover { filter: brightness(1.12); }
+  .btn2 { background: linear-gradient(135deg, #1f8f6b, #14684d); margin-top: 10px; }
+  .btn:hover, .btn2:hover { filter: brightness(1.12); }
   .hint { text-align: center; color: #7d74a8; font-size: 12.5px; margin-top: 14px; }
-  .err { color: #ff8f8f; text-align: center; padding: 40px 0; font-size: 15px; }
+  hr { border: 0; border-top: 1px solid rgba(255,255,255,0.09); margin: 26px 0 20px; }
+  .form-title { font-size: 15px; font-weight: 600; margin-bottom: 14px; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 12.5px; color: #a99fd6; margin-bottom: 6px; }
+  .field input {
+    width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.14);
+    background: rgba(0,0,0,0.35); color: #e8e6f5; font-size: 14px; outline: none;
+  }
+  .field input:focus { border-color: #8a3bff; }
+  .msg { font-size: 13px; margin-top: 12px; text-align: center; min-height: 18px; }
+  .msg.ok { color: #5ce0a8; }
+  .msg.err { color: #ff8f8f; }
 </style>
 </head>
 <body>
   <div class="card">
     <h1>🐝 Hermes Mobile Bridge</h1>
-    <div class="sub">Pair your app with this server</div>
+    <div class="sub">Pair your phone app — quick connect</div>
     <div class="qr-wrap"><img src="/setup/qr?token={token}" alt="Pairing QR code"></div>
     <ol>
       <li>Open <b>Hermes</b> app on your phone</li>
       <li>Go to <b>Settings → Add Connection</b></li>
       <li>Tap <b>Scan QR code</b> and point at this screen</li>
-      <li>Done — the app auto-configures host, API key &amp; token</li>
+      <li>Done — the app auto-configures and registers a device account</li>
     </ol>
     <div class="info"><b>Server</b> {base_url}</div>
     <a class="btn" href="/setup/qr?token={token}" download="hermes-connect.png">Download QR</a>
     <div class="hint">QR encodes the setup token — it rotates on server restart.</div>
+
+    <hr>
+
+    <div class="form-title">Create an account (optional — for the app's login form)</div>
+    <form id="regform" autocomplete="off">
+      <div class="field">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" required placeholder="you@example.com" autocomplete="email">
+      </div>
+      <div class="field">
+        <label for="pw">Password (min 8 characters)</label>
+        <input type="password" id="pw" name="pw" required minlength="8" placeholder="••••••••" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="pw2">Confirm password</label>
+        <input type="password" id="pw2" name="pw2" required minlength="8" placeholder="••••••••" autocomplete="new-password">
+      </div>
+      <button type="submit" class="btn2" id="regbtn">Create account</button>
+      <div class="msg" id="regmsg"></div>
+    </form>
+    <div class="hint">HTTP private-network note: use a strong, unique password.</div>
   </div>
+<script>
+  document.getElementById("regform").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var email = document.getElementById("email").value.trim();
+    var pw = document.getElementById("pw").value;
+    var pw2 = document.getElementById("pw2").value;
+    var msg = document.getElementById("regmsg");
+    var btn = document.getElementById("regbtn");
+    if (pw !== pw2) { msg.className = "msg err"; msg.textContent = "Passwords do not match"; return; }
+    msg.className = "msg"; msg.textContent = "Creating account…";
+    btn.disabled = true;
+    try {
+      var r = await fetch("/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: email, password: pw })
+      });
+      var data = await r.json();
+      if (r.ok) {
+        msg.className = "msg ok";
+        msg.textContent = "Account created ✓ — log in with this email in the app";
+        document.getElementById("email").value = "";
+        document.getElementById("pw").value = "";
+        document.getElementById("pw2").value = "";
+      } else {
+        msg.className = "msg err";
+        msg.textContent = (data.detail || "Registration failed") + "";
+      }
+    } catch (err) {
+      msg.className = "msg err";
+      msg.textContent = "Network error — is the server reachable?";
+    }
+    btn.disabled = false;
+  });
+</script>
 </body>
 </html>"""
+
 
 
 @app.get("/setup")
@@ -1876,6 +1980,22 @@ async def on_startup():
 # ─── Main ────────────────────────────────────────────────────────────────
 
 
+def _open_browser_best_effort(url: str) -> None:
+    """Open the pairing page in the default browser (best-effort; silent on
+    headless machines / Termux where xdg-open doesn't exist)."""
+    try:
+        import platform as _platform
+        sysname = _platform.system().lower()
+        if "linux" in sysname:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif "darwin" in sysname:
+            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif "windows" in sysname:
+            subprocess.Popen(["cmd", "/c", "start", "", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     # ─── OmniRoute Auto Lifecycle Management ───
     # Bridge auto-detects, starts (if needed), and configures OmniRoute
@@ -2014,6 +2134,8 @@ if __name__ == "__main__":
         print(f"📱 Pairing page: http://{_setup_ip}:{PORT}/setup?token={SETUP_TOKEN}")
         print(f"📱 App setup: http://{_setup_ip}:{PORT}/setup/connect?token={SETUP_TOKEN}")
         print(f"📱 Scan QR:   http://{_setup_ip}:{PORT}/setup/qr?token={SETUP_TOKEN}")
+        # Auto-open the secure pairing page so the QR is one click away.
+        _open_browser_best_effort(f"http://{_setup_ip}:{PORT}/setup?token={SETUP_TOKEN}")
     except Exception:
         pass
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
