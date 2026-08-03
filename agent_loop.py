@@ -52,6 +52,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "terminal (shell commands), file_ops (read/write/patch/search files), "
     "and web (search/extract URLs). "
     "When a task requires external action, use the appropriate tool."
+    "\n\n"
+    "For HEAVY or complex work — big coding projects, multi-step research, "
+    "anything needing memory, skills, vision, or subagents — delegate to "
+    "`hermes_task` (the full Hermes Agent on this machine). It is slower "
+    "(tens of seconds to minutes) but far more capable. Use it instead of "
+    "stumbling through many small tool calls yourself."
 )
 
 # Forced by the server at setup (CAVEMAN_STYLE=1 is written into the bridge's
