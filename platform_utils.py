@@ -179,3 +179,100 @@ def omniroute_bin() -> str:
     urllib.request.urlretrieve(urls, target)
     target.chmod(0o755)
     return str(target)
+
+
+# ─── Whisper STT (whisper.cpp) ─────────────────────────────────────────
+
+WHISPER_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+_WHISPER_RELEASE = "https://github.com/ggml-org/whisper.cpp/releases/latest/download"
+
+
+def _flatten_tree(src: Path, dst: Path) -> None:
+    """Move the CONTENTS of src's single top-level dir up into dst, so the
+    whisper-cli binary and its shared libs ($ORIGIN resolution) end up side
+    by side in dst. Handles both tar/zip layouts (one root dir each)."""
+    if not src.exists():
+        return
+    roots = [p for p in src.iterdir() if p.is_dir()]
+    root = roots[0] if len(roots) == 1 else src
+    for item in root.iterdir():
+        shutil.move(str(item), str(dst / item.name))
+
+
+def whisper_cli() -> str | None:
+    """Path to the whisper.cpp CLI, installing the official prebuilt if
+    missing (Linux x64/arm64 + Windows x64 have releases; macOS → brew
+    whisper-cpp; Android/Termux → compile instructions). Returns None when
+    unavailable so callers can degrade (STT falls back to the phone's
+    recognizer)."""
+    target = _bin_dir() / exe_name("whisper-cli")
+    if target.exists():
+        return str(target)
+    if shutil.which("whisper-cli"):
+        return "whisper-cli"
+    os_name = detect_os()
+    if os_name == "windows":
+        url = f"{_WHISPER_RELEASE}/whisper-bin-x64.zip"
+        archive = _bin_dir() / "whisper-bin-x64.zip"
+        import urllib.request, zipfile
+        print("   ⬇ Downloading whisper-cli (Windows x64)…")
+        urllib.request.urlretrieve(url, archive)
+        tmp = _bin_dir() / "_whisper_tmp"
+        tmp.mkdir(exist_ok=True)
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(tmp)
+        # Flatten the single top-level dir so libs + exe sit beside each
+        # other in _bin_dir() (whisper-cli resolves $ORIGIN libs itself).
+        _flatten_tree(tmp, _bin_dir())
+        shutil.rmtree(tmp, ignore_errors=True)
+        archive.unlink(missing_ok=True)
+        return str(target)
+    if os_name == "linux":
+        arch = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "x64"
+        url = f"{_WHISPER_RELEASE}/whisper-bin-ubuntu-{arch}.tar.gz"
+        archive = _bin_dir() / f"whisper-bin-ubuntu-{arch}.tar.gz"
+        import tarfile, urllib.request
+        print(f"   ⬇ Downloading whisper-cli (Linux {arch})…")
+        urllib.request.urlretrieve(url, archive)
+        tmp = _bin_dir() / "_whisper_tmp"
+        tmp.mkdir(exist_ok=True)
+        # filter="data" avoids the Python 3.14 tar sanitization warning.
+        with tarfile.open(archive) as tf:
+            tf.extractall(tmp, filter="data")
+        _flatten_tree(tmp, _bin_dir())
+        shutil.rmtree(tmp, ignore_errors=True)
+        archive.unlink(missing_ok=True)
+        target.chmod(0o755)
+        return str(target)
+    if os_name == "macos":
+        # No prebuilt macOS CLI in the release — brew whisper-cpp ships one.
+        if shutil.which("brew"):
+            print("   ⬇ Installing whisper-cpp via Homebrew…")
+            subprocess.run(["brew", "install", "whisper-cpp"], capture_output=True, timeout=600)
+            if shutil.which("whisper-cli"):
+                return "whisper-cli"
+        print("   ⚠ whisper-cli unavailable — install it:")
+        print("     brew install whisper-cpp")
+        return None
+    # Android/Termux: no official prebuilt (bionic libc) — compile once:
+    print("   ⚠ whisper-cli not found on Android — compile it (one time):")
+    print("     git clone https://github.com/ggml-org/whisper.cpp && cd whisper.cpp")
+    print("     cmake -B build -DWHISPER_BUILD_TESTS=OFF && cmake --build build -j4")
+    print(f"     cp build/bin/whisper-cli {target}")
+    return None
+
+
+def whisper_model() -> str:
+    """Path to the multilingual whisper model (ggml-base, ~141MB, covers
+    Marathi/Hindi + all major world languages), downloading if missing."""
+    store = Path(os.getenv("STORE_PATH", Path.home() / ".hermes-mobile-server"))
+    model = store / "models" / "ggml-base.bin"
+    if model.exists() and model.stat().st_size > 100_000_000:
+        return str(model)
+    model.parent.mkdir(parents=True, exist_ok=True)
+    print("   ⬇ Downloading whisper model ggml-base (~141MB)…")
+    tmp = model.with_suffix(".download")
+    import urllib.request
+    urllib.request.urlretrieve(WHISPER_MODEL_URL, tmp)
+    tmp.replace(model)
+    return str(model)

@@ -206,6 +206,7 @@ def _start_server(port: int, host: str, omniroute: bool) -> None:
     if omniroute:
         _ensure_omnirouter()
     ts_ip = _ensure_tailscale()
+    _ensure_whisper()
 
     # Forced defaults (caveman + context headroom) are persisted at setup so
     # they survive restarts and apply to every conversation automatically.
@@ -364,6 +365,24 @@ def _ensure_omnirouter() -> None:
                 os.environ.get("AI_MODEL", "?"),
                 os.environ.get("AI_BASE_URL", "?"),
                 or_key[:8] if or_key else "none", or_key[-4:] if or_key else "")
+
+
+def _ensure_whisper() -> None:
+    """Auto-lifecycle for STT: whisper-cli + multilingual model (downloads
+    the official prebuilt per-OS when missing; Android prints compile
+    instructions). Voice screen falls back to the phone recognizer when
+    unavailable — never blocks startup."""
+    if os.getenv("STT_BIN") and Path(os.getenv("STT_BIN", "")).exists():
+        return  # custom binary configured
+    try:
+        cli = platform_utils.whisper_cli()
+        if cli is None:
+            print("   ⚠ Whisper STT unavailable — voice will use the system recognizer (with beep)")
+            return
+        model = os.getenv("STT_MODEL") or platform_utils.whisper_model()
+        print(f"   🎙 Whisper STT: {model}")
+    except Exception as e:
+        logger.warning("Whisper STT setup skipped: %s", e)
 
 
 def _ensure_tailscale() -> str:

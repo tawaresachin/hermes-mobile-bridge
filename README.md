@@ -102,7 +102,11 @@ screen uses it instead of the Android recognizer, so there is NO system
 "listening" beep and Indian-language accuracy is better (all 9 app
 languages supported; omit `?lang=` to let whisper auto-detect).
 
-Setup on the bridge device:
+**Included in the one-command installer by default** (skip with
+`--no-stt`): the whisper-cli binary is auto-downloaded per OS (Linux
+x64/arm64, Windows x64; macOS via `brew install whisper-cpp`; Android
+prints one-time compile steps) and the ~141MB multilingual model is
+fetched on first start. Manual setup (e.g. custom model):
 
 ```sh
 git clone --depth 1 https://github.com/ggml-org/whisper.cpp && cd whisper.cpp
