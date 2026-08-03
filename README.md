@@ -122,15 +122,19 @@ automatically falls back to the Android SpeechRecognizer (with its beep).
 
 ## TTS provider routing
 
-The bridge's `/api/tts` follows **Hermes' TTS config** (`~/.hermes/config.yaml` → `tts:`):
+The bridge's `/api/tts` powers the app's voice screen and **always uses
+the built-in edge-tts** with the app's 9-language voice selector
+(`en-IN-NeerjaNeural`, `hi-IN-SwaraNeural`, …) — **it deliberately does
+NOT follow `~/.hermes/config.yaml`'s `tts.provider`**, because that
+provider (e.g. Gemini) has its own quotas (Gemini free tier = 3 TTS
+requests/day) that would break voice replies mid-conversation.
 
-- **`tts.provider` unset or `edge`** (default) → built-in edge-tts with the app's
-  9-language voice selector (`en-IN-NeerjaNeural`, `hi-IN-SwaraNeural`, …)
-- **`tts.provider` set to anything else** (`elevenlabs`, `openai`, `xai`, `minimax`,
-  `gemini`, `mistral`, `deepinfra`, `piper`, `neutts`, `kittentts`, or a custom
-  `type: command` provider) → synthesis is delegated to Hermes' own
-  `text_to_speech_tool`, so premium voices work by configuring Hermes normally.
-  Unknown providers fall back to edge inside Hermes' tool (fail-open).
+To delegate to Hermes' configured provider (`elevenlabs`, `openai`,
+`gemini`, custom `type: command`, …) anyway:
+
+```sh
+BRIDGE_TTS_PROVIDER=hermes
+```
 
 ## Security
 

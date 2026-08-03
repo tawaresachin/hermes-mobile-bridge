@@ -915,15 +915,14 @@ if _HERMES_ROOT not in sys.path:
 import edge_tts
 
 def _configured_provider():
-    try:
-        import yaml
-        cfg_path = os.path.join(os.path.expanduser('~'), '.hermes', 'config.yaml')
-        if os.path.exists(cfg_path):
-            cfg = yaml.safe_load(open(cfg_path)) or {}
-            return ((cfg.get('tts') or {}).get('provider') or 'edge').lower()
-    except Exception:
-        pass
-    return 'edge'
+    # The app's voice screen ALWAYS sends edge-tts voice names (Neerja,
+    # Aarohi, …), so the bridge defaults to edge-tts REGARDLESS of the
+    # shared ~/.hermes/config.yaml (whose provider — e.g. Gemini — has its
+    # own quotas and can 429 after 3 requests, breaking voice replies).
+    # Opt into Hermes-provider delegation explicitly:
+    #   BRIDGE_TTS_PROVIDER=hermes
+    env = os.getenv("BRIDGE_TTS_PROVIDER", "").lower()
+    return env if env in ("edge", "hermes") else "edge"
 
 def _hermes_synth(text):
     """Delegate to Hermes' text_to_speech_tool (premium / custom providers)."""
@@ -1092,14 +1091,8 @@ class _EdgeTtsWorker:
             "if _HERMES_ROOT not in sys.path: sys.path.insert(0, _HERMES_ROOT)\n"
             "import edge_tts\n"
             "def _provider():\n"
-            "    try:\n"
-            "        import yaml\n"
-            "        p = os.path.join(os.path.expanduser('~'), '.hermes', 'config.yaml')\n"
-            "        if os.path.exists(p):\n"
-            "            c = yaml.safe_load(open(p)) or {}\n"
-            "            return ((c.get('tts') or {}).get('provider') or 'edge').lower()\n"
-            "    except Exception: pass\n"
-            "    return 'edge'\n"
+            "    e = os.getenv('BRIDGE_TTS_PROVIDER', '').lower()\n"
+            "    return e if e in ('edge', 'hermes') else 'edge'\n"
             "def _hermes():\n"
             "    import tempfile\n"
             "    from tools.tts_tool import text_to_speech_tool\n"
