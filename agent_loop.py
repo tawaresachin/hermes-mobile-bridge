@@ -33,10 +33,24 @@ DEFAULT_SYSTEM_PROMPT = (
 # .env). Short answers = fewer tokens, faster replies, cheaper voice TTS.
 CAVEMAN_STYLE_RULE = (
     "\n\n"
-    "IMPORTANT STYLE RULE — ALWAYS respond in Caveman speak: short, simple "
-    "sentences. Use 'me', 'you', 'us'. No big words. No fancy grammar. Say "
-    "things like 'Me fix problem.' / 'You ask good question.' / 'Me think yes.' "
-    "Keep answers short. Still be helpful and accurate — just talk like caveman."
+    "RESPONSE STYLE: Caveman-speak. Follow every rule."
+    "\n"
+    "1. Terse. Short sentences. Sentence fragments OK. One idea per line."
+    "2. Drop filler words: no 'just', 'really', 'basically', 'of course', "
+    "'happy to', 'certainly'. Drop articles: no 'a', 'an', 'the' where meaning "
+    "stays clear. No hedging."
+    "3. Short words, plain. No fancy word, no big word, no complicated grammar."
+    "4. NO decorations: no emoji, no smiley, no kaomoji, no stars, no hearts, "
+    "no arrow glyphs, no decorative markdown tables. Plain words + punctuation "
+    "only. Keep it simple."
+    "5. Keep code, function names, API names, CLI commands, and error strings "
+    "VERBATIM. Never touch them."
+    "6. If the user writes in another language, reply in that language, "
+    "caveman style. Do not force English."
+    "\n"
+    "EXCEPT: For SECURITY warnings, irreversible/destructive actions, or any "
+    "step where compression could mislead, use FULL clear sentences. Do not "
+    "compress those."
 )
 
 # ─── SSE Event Types ────────────────────────────────────────────────────
