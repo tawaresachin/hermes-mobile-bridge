@@ -121,6 +121,54 @@ def _resolve_api_key(session_id: str) -> str:
 MAX_SESSION_OVERRIDES = 200
 
 
+# ─── Persistent session model overrides ─────────────────────────────────
+# Session switches live in-memory for routing speed, but a server restart
+# used to wipe them silently — the app then showed the DEFAULT model again
+# ("I switched but it shows old"). Persist {sid: {model, base_url}} and
+# re-resolve API keys at boot from config/env (keys are never stored).
+
+def _session_overrides_path() -> Path:
+    return STORE_PATH / "session_overrides.json"
+
+
+def _save_session_overrides() -> None:
+    try:
+        data = {
+            sid: {
+                "model": model,
+                "base_url": _session_base_url_overrides.get(sid, ""),
+            }
+            for sid, model in _session_model_overrides.items()
+        }
+        _session_overrides_path().write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        logger.warning("Failed to save session overrides: %s", e)
+
+
+def _load_session_overrides() -> None:
+    try:
+        p = _session_overrides_path()
+        if not p.exists():
+            return
+        data = json.loads(p.read_text())
+        for sid, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            model = info.get("model", "")
+            bu = info.get("base_url", "")
+            if model:
+                _session_model_overrides[sid] = model
+            if bu:
+                _session_base_url_overrides[sid] = bu
+                key = _runtime_key_for_base_url(bu)
+                if key:
+                    _session_api_key_overrides[sid] = key
+        if data:
+            logger.info("Restored %d session model override(s)", len(data))
+    except Exception as e:
+        logger.warning("Failed to load session overrides: %s", e)
+
+
 def _bounded_override(d: dict, key: str) -> None:
     if len(d) >= MAX_SESSION_OVERRIDES:
         # Evict the oldest inserted key (dicts preserve insertion order)
@@ -268,6 +316,9 @@ def _handle_special_command(query: str, session_id: str) -> tuple[bool, str | No
                 key = _runtime_key_for_base_url(_model_base_url_map[model_name])
                 if key:
                     _session_api_key_overrides[session_id] = key
+            # Persist so the switch survives server restarts (and the app
+            # never sees the model "revert to old" after a reboot).
+            _save_session_overrides()
             return True, f"✅ Model switched to `{model_name}` for this session."
 
     return False, None
@@ -2266,6 +2317,9 @@ async def on_startup():
     await start_discovery()
     # Load persisted claim tokens so pairing QRs survive restarts.
     _claims_load()
+    # Restore per-session model switches so a server restart doesn't
+    # silently reset every chat/voice session back to the default model.
+    _load_session_overrides()
     # Load the persisted models cache so the app's model picker is instant
     # after a server restart, then warm it in the background.
     _models_load_from_disk()
