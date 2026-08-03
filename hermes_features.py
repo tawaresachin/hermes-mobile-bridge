@@ -891,8 +891,23 @@ def load_project_rules() -> str:
 # ─── Full System Prompt Assembly ─────────────────────────────────────────
 
 
+# System prompt cache: skills/personality/rules loading touches the disk
+# on EVERY chat request (~800ms measured) — rebuild at most once per 30s.
+_sysprompt_cache: tuple[float, str, str] | None = None  # (ts, base_prompt, prompt)
+
+
 def build_system_prompt(base_prompt: str, session_dir: str = "") -> str:
-    """Assemble the complete system prompt: base + skills + rules."""
+    """Assemble the complete system prompt: base + skills + rules.
+
+    Cached for 30s (keyed by base_prompt) — the pieces (skills, personality,
+    project rules, commands) change rarely, and the disk reads cost ~800ms
+    per request when uncached.
+    """
+    global _sysprompt_cache
+    now = time.time()
+    if _sysprompt_cache and _sysprompt_cache[0] > now - 30 and _sysprompt_cache[1] == base_prompt:
+        return _sysprompt_cache[2]
+
     parts = [base_prompt]
 
     # Add warm personality
@@ -919,4 +934,6 @@ def build_system_prompt(base_prompt: str, session_dir: str = "") -> str:
         "Commands: " + ", ".join(f"`{c}`" for c in sorted(COMMANDS.keys()))
     )
 
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+    _sysprompt_cache = (now, base_prompt, result)
+    return result
