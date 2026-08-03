@@ -14,6 +14,31 @@ import httpx
 from tools import ToolCall, ToolResult, ToolRegistry, registry
 from hermes_features import handle_command, build_system_prompt
 
+
+def _hermes_compression() -> dict:
+    """Load Hermes Agent's own compression settings so the bridge enforces the
+    SAME per-session context headroom by default. Falls back to safe defaults:
+        protect_last_n = 20  (messages kept verbatim)
+        threshold      = 0.5 (start compressing once history ratio exceeds 0.5)
+        target_ratio   = 0.2 (compress down to ~20% of context)
+    Env vars (CONTEXT_RECENT_K / CONTEXT_SUMMARY_BATCH) still override."""
+    comp = {"protect_last_n": 20, "threshold": 0.5, "target_ratio": 0.2}
+    try:
+        import yaml
+        path = os.path.expanduser("~/.hermes/config.yaml")
+        if os.path.exists(path):
+            data = yaml.safe_load(open(path).read()) or {}
+            c = data.get("compression") or {}
+            if isinstance(c, dict):
+                comp = {
+                    "protect_last_n": int(c.get("protect_last_n", 20)),
+                    "threshold": float(c.get("threshold", 0.5)),
+                    "target_ratio": float(c.get("target_ratio", 0.2)),
+                }
+    except Exception:
+        pass
+    return comp
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
     "You are helpful, knowledgeable, and direct. "
@@ -135,10 +160,13 @@ class AgentLoop:
         # Per-session locks so concurrent turns can't race on the summary file
         self._summary_locks: dict[str, asyncio.Lock] = {}
         # Context "headroom" tuning — env-forced at setup, always-on defaults.
-        # RECENT_K messages stay verbatim; older ones roll into the summary
-        # in batches of SUMMARY_BATCH (tokens stay flat on long sessions).
-        self.recent_k = int(os.getenv("CONTEXT_RECENT_K", str(AgentLoop.RECENT_K)))
+        # Enforce Hermes Agent's OWN compression as the per-session default
+        # (protect_last_n, threshold, target_ratio) so every app session keeps
+        # the same context headroom Hermes uses. Env vars override.
+        _headroom = _hermes_compression()
+        self.recent_k = int(os.getenv("CONTEXT_RECENT_K", str(_headroom["protect_last_n"])))
         self.summary_batch = int(os.getenv("CONTEXT_SUMMARY_BATCH", str(AgentLoop.SUMMARY_BATCH)))
+        self.comp_target_ratio = float(os.getenv("CONTEXT_TARGET_RATIO", str(_headroom["target_ratio"])))
         # Caveman style: forced ON by the server (CAVEMAN_STYLE=1 written at
         # setup). Set 0 only to disable explicitly.
         self.caveman_style = os.getenv("CAVEMAN_STYLE", "1").lower() not in ("0", "false", "no", "off")
