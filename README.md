@@ -91,6 +91,30 @@ No Tailscale? Cloudflare tunnel is the automatic fallback (kept fresh by the sup
 | `CONTEXT_RECENT_K` | `24` | Verbatim recent-message window (headroom) |
 | `CONTEXT_SUMMARY_BATCH` | `12` | Older messages rolled into the summary |
 | `STORE_PATH` | `~/.hermes-mobile-server` | Messages / cache / QR data |
+| `STT_BIN` | `~/.hermes-mobile-bridge/bin/whisper-cli` | whisper.cpp CLI for `/api/stt` |
+| `STT_MODEL` | `<STORE_PATH>/models/ggml-base.bin` | whisper model (multilingual, incl. Marathi/Hindi) |
+
+## Speech-to-text (Whisper)
+
+The bridge's `/api/stt` transcribes uploaded 16 kHz mono WAV audio via
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) — the app's voice
+screen uses it instead of the Android recognizer, so there is NO system
+"listening" beep and Indian-language accuracy is better (all 9 app
+languages supported; omit `?lang=` to let whisper auto-detect).
+
+Setup on the bridge device:
+
+```sh
+git clone --depth 1 https://github.com/ggml-org/whisper.cpp && cd whisper.cpp
+cmake -B build -DWHISPER_BUILD_TESTS=OFF && cmake --build build -j4
+mkdir -p ~/.hermes-mobile-bridge/bin ~/.hermes-mobile-server/models
+cp build/bin/whisper-cli ~/.hermes-mobile-bridge/bin/
+curl -sL -o ~/.hermes-mobile-server/models/ggml-base.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+```
+
+Then restart the server. If whisper is missing, the app's voice screen
+automatically falls back to the Android SpeechRecognizer (with its beep).
 
 ## TTS provider routing
 

@@ -1216,6 +1216,69 @@ async def text_to_speech(body: TtsRequest, user: dict = Depends(verify_bearer)):
     return Response(content=audio, media_type="audio/mpeg")
 
 
+# ─── Speech-to-text (whisper.cpp) ───────────────────────────────────────
+# Runs as a subprocess so the server process never loads the model into
+# its own memory (keeps the bridge flat on RAM). One run at a time — the
+# pad CPU shouldn't thrash on concurrent voice messages.
+STT_BIN = os.getenv("STT_BIN", str(Path.home() / ".hermes-mobile-bridge" / "bin" / "whisper-cli"))
+STT_MODEL = os.getenv("STT_MODEL", str(STORE_PATH / "models" / "ggml-base.bin"))
+_stt_lock = asyncio.Lock()
+
+
+@app.post("/api/stt")
+async def speech_to_text(request: Request, lang: str = "", user: dict = Depends(verify_bearer)):
+    """Transcribe uploaded audio (16 kHz mono WAV) via whisper.cpp.
+
+    Body = raw WAV bytes. Returns {"text": "..."}. Optional ?lang= hint
+    (e.g. mr, hi, en); omitted → whisper auto-detects.
+    """
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(status_code=400, detail="empty audio body")
+    if len(audio) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="audio too large (max 25MB)")
+    if not Path(STT_BIN).exists():
+        raise HTTPException(status_code=501, detail="whisper-cli not installed (set STT_BIN)")
+    if not Path(STT_MODEL).exists():
+        raise HTTPException(status_code=501, detail=f"whisper model missing: {STT_MODEL}")
+
+    lang_code = (lang or "").strip().lower()[:2]
+
+    async def _run() -> str:
+        async with _stt_lock:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=str(STORE_PATH)) as tf:
+                tf.write(audio)
+                tmp_wav = tf.name
+            try:
+                cmd = [STT_BIN, "-m", STT_MODEL, "-f", tmp_wav, "-otxt", "-t", "4", "-np"]
+                if lang_code:
+                    cmd += ["-l", lang_code]
+                r = await asyncio.to_thread(
+                    subprocess.run, cmd, capture_output=True, text=True, timeout=60
+                )
+                out_txt = Path(tmp_wav + ".txt")
+                text = out_txt.read_text(encoding="utf-8").strip() if out_txt.exists() else ""
+                out_txt.unlink(missing_ok=True)
+                if not text and r.returncode != 0:
+                    raise RuntimeError((r.stderr or r.stdout or "whisper failed").strip()[:200])
+                return text
+            finally:
+                try:
+                    Path(tmp_wav).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    try:
+        text = await asyncio.wait_for(_run(), timeout=75)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="STT timed out")
+    except Exception as e:
+        logger.warning("STT failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"STT failed: {e}")
+    return {"text": text}
+
+
 # ─── Models cache (module-level, disk-persisted + lazy refresh) ───
 # Persisted to disk so a server restart NEVER wipes it: the app's model
 # picker gets an instant answer at startup. When the cache is stale we
