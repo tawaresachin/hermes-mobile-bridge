@@ -1791,6 +1791,13 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
     width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.14);
     background: rgba(0,0,0,0.35); color: #e8e6f5; font-size: 14px; outline: none;
   }
+  .pw-row { position: relative; }
+  .pw-row input { padding-right: 42px; }
+  .eye {
+    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+    background: none; border: 0; cursor: pointer; color: #8d84b5; padding: 6px;
+  }
+  .eye svg { width: 18px; height: 18px; display: block; }
   .field input:focus { border-color: #8a3bff; }
   .btn {
     display: block; width: 100%; text-align: center; background: linear-gradient(135deg, #8a3bff, #5b21d6);
@@ -1832,11 +1839,17 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
         </div>
         <div class="field">
           <label for="pw">Password (min 8 characters)</label>
-          <input type="password" id="pw" name="pw" required minlength="8" placeholder="••••••••" autocomplete="new-password">
+          <div class="pw-row">
+            <input type="password" id="pw" name="pw" required minlength="8" placeholder="••••••••" autocomplete="new-password">
+            <button type="button" class="eye" data-target="pw" aria-label="Show password"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+          </div>
         </div>
         <div class="field" id="pw2field">
           <label for="pw2">Confirm password</label>
-          <input type="password" id="pw2" name="pw2" required minlength="8" placeholder="••••••••" autocomplete="new-password">
+          <div class="pw-row">
+            <input type="password" id="pw2" name="pw2" required minlength="8" placeholder="••••••••" autocomplete="new-password">
+            <button type="button" class="eye" data-target="pw2" aria-label="Show password"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+          </div>
         </div>
         <button type="submit" class="btn" id="actbtn">Create account</button>
         <button type="button" class="link" id="togbtn">Already registered? Log in</button>
@@ -1872,8 +1885,17 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
     regMode = !regMode;
     document.getElementById("step1title").textContent = regMode ? "Create your account" : "Log in";
     document.getElementById("pw2field").style.display = regMode ? "block" : "none";
+    // FIX: a hidden field with `required` still blocks form submission.
+    // Disabling it in login mode lets the submit event actually fire.
+    document.getElementById("pw2").disabled = !regMode;
     document.getElementById("actbtn").textContent = regMode ? "Create account" : "Log in";
     document.getElementById("msg1").className = "msg"; document.getElementById("msg1").textContent = "";
+  });
+  document.querySelectorAll(".eye").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var inp = document.getElementById(btn.dataset.target);
+      inp.type = (inp.type === "password") ? "text" : "password";
+    });
   });
   document.getElementById("backbtn").addEventListener("click", function () { showStep(1); });
   document.getElementById("regform").addEventListener("submit", async function (e) {
@@ -1922,7 +1944,10 @@ async def setup_page(request: Request, token: str = ""):
         raise HTTPException(status_code=401, detail="Invalid setup token")
     base_url = str(request.base_url).rstrip("/")
     page = SETUP_PAGE_HTML.replace("{token}", token or SETUP_TOKEN).replace("{base_url}", base_url)
-    return HTMLResponse(page)
+    return HTMLResponse(
+        page,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/setup/qr")
@@ -1967,7 +1992,11 @@ async def setup_qr(request: Request, token: str = "", claim: str = ""):
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
-    return Response(content=buf.getvalue(), media_type="image/png")
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/setup/connect")
