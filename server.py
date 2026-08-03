@@ -1460,15 +1460,19 @@ def _fetch_models_sync(session_id: str) -> dict:
             continue
         cp_model = cp.get("model", "")
         cp_name = cp.get("name", "custom")
-        if cp_model and cp_model not in seen:
-            seen.add(cp_model)
+        cp_base = cp.get("base_url", "")
+        cp_models = [cp_model] + list(cp.get("models", []) or [])
+        for cp_id in cp_models:
+            if not cp_id or cp_id in seen:
+                continue
+            seen.add(cp_id)
             models.append({
-                "id": cp_model,
-                "name": cp_model.split("/")[-1] if "/" in cp_model else cp_model,
+                "id": cp_id,
+                "name": cp_id.split("/")[-1] if "/" in cp_id else cp_id,
                 "isFree": False,
                 "isVision": False,
                 "provider": cp_name.lower().replace(" ", "-"),
-                "baseUrl": cp.get("base_url", ""),
+                "baseUrl": cp_base,
             })
 
     # ── Normalize flags by model id (consistency across providers) ──
