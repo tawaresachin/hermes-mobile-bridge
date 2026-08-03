@@ -33,8 +33,9 @@ def get_tunnel_url() -> str:
     url = os.getenv("HERMES_TUNNEL_URL", "")
     if url:
         return url
-    # Try to detect from cloudflared log
-    url_file = Path(os.getenv("TUNNEL_LOG", "/data/data/com.termux/files/home/.hermes-mobile-server/.current_tunnel_url"))
+    # Try to detect from cloudflared log (store lives under STORE_PATH on
+    # every OS; TUNNEL_LOG env overrides for custom setups)
+    url_file = Path(os.getenv("TUNNEL_LOG", str(Path.home() / ".hermes-mobile-server" / ".current_tunnel_url")))
     if url_file.exists():
         import re
         content = url_file.read_text()
