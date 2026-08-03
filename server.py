@@ -1332,13 +1332,20 @@ async def list_models(session_id: str = "", user: dict = Depends(verify_bearer))
 
     with _models_lock:
         if _models_cache and now - _models_cache_ts < cache_ttl:
-            return _models_cache
+            # Cache hit — but "current" must be LIVE per session (a model
+            # switch seconds ago must show immediately, not after the
+            # 30-min TTL).
+            fresh = dict(_models_cache)
+            fresh["current"] = _resolve_model(session_id)
+            return fresh
 
     # Stale but present: serve now, refresh in the background.
     if _models_cache:
         loop = asyncio.get_running_loop()
         loop.run_in_executor(None, _refresh_models_background, session_id)
-        return _models_cache
+        fresh = dict(_models_cache)
+        fresh["current"] = _resolve_model(session_id)
+        return fresh
 
     # No cache at all (first boot): fetch once, synchronously.
     result = await asyncio.to_thread(_fetch_models_sync, session_id)
