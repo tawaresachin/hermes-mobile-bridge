@@ -1644,7 +1644,7 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
         except asyncio.CancelledError:
             # Client disconnected — save what we have
             logger.warning(f"Stream cancelled for session {session_id}, saving partial response")
-            if full_assistant_response:
+            if full_assistant_response.strip():
                 _save_assistant_message(
                     session_id, full_assistant_response,
                     reasoning_content="".join(reasoning_chunks),
@@ -1658,8 +1658,9 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             yield "data: [DONE]\n\n"
             return
 
-        # Save assistant response to history
-        if full_assistant_response:
+        # Save assistant response to history (skip whitespace-only turns —
+        # they'd show as blank rows/gaps in the app's chat).
+        if full_assistant_response.strip():
             logger.info(f"Saving assistant response for session {session_id} ({len(full_assistant_response)} chars)")
             _save_assistant_message(
                 session_id, full_assistant_response,
@@ -1740,7 +1741,7 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     if error_msg:
         return {"response": f"⚠️ {error_msg}", "session_id": session_id}
 
-    if final_response:
+    if final_response.strip():
         _save_assistant_message(
             session_id, final_response,
             reasoning_content="".join(reasoning_chunks),
