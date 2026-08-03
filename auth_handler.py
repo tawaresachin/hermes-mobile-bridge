@@ -5,6 +5,7 @@ Re-exports auth_db functions for convenience.
 """
 from __future__ import annotations
 
+import asyncio
 import secrets
 import hashlib
 import time
@@ -106,7 +107,8 @@ def verify_refresh_token_hash(raw_token: str, stored_hash: str) -> bool:
 async def register_user(store_path: Path, email: str, password: str) -> dict:
     """Full registration flow. Returns token dict."""
     auth_db = get_auth_db(store_path)
-    user = auth_db.create_user(email, password)
+    # bcrypt (12 rounds ≈ 250 ms) off the event loop
+    user = await asyncio.to_thread(auth_db.create_user, email, password)
     secret = get_jwt_secret(store_path)
     access = create_access_token(user.id, user.email, secret)
     refresh_raw, _ = generate_refresh_token()
@@ -134,7 +136,10 @@ async def login_user(store_path: Path, email: str, password: str) -> Optional[di
     """Full login flow. Returns token dict or None if invalid."""
     auth_db = get_auth_db(store_path)
     user = auth_db.get_user_by_email(email)
-    if not user or not verify_password(password, user.password_hash):
+    if not user:
+        return None
+    # bcrypt verify (~250 ms) off the event loop
+    if not await asyncio.to_thread(verify_password, password, user.password_hash):
         return None
     secret = get_jwt_secret(store_path)
     access = create_access_token(user.id, user.email, secret)

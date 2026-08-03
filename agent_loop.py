@@ -39,6 +39,10 @@ def _hermes_compression() -> dict:
         pass
     return comp
 
+# Shared HTTP client — ONE connection pool for all module-level streams
+# (simple_chat_stream etc.). Per-request clients leak fds/connections.
+_SHARED_HTTP = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
     "You are helpful, knowledgeable, and direct. "
@@ -364,27 +368,27 @@ class AgentLoop:
                 parts.append(f"{role.upper()}: {content}")
         user_content = "\n".join(parts) or "(empty)"
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0)) as client:
-                resp = await client.post(
-                    f"{self.ai_base_url.rstrip('/')}/chat/completions",
-                    headers={"Authorization": f"Bearer {self.ai_api_key}"},
-                    json={
-                        "model": self.ai_model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user_content},
-                        ],
-                        "max_tokens": 500,
-                        "stream": False,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-                words = text.split()
-                if len(words) > self.SUMMARY_MAX_WORDS:
-                    text = " ".join(words[: self.SUMMARY_MAX_WORDS])
-                return text.strip()
+            resp = await self._http.post(
+                f"{self.ai_base_url.rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {self.ai_api_key}"},
+                json={
+                    "model": self.ai_model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "max_tokens": 500,
+                    "stream": False,
+                },
+                timeout=httpx.Timeout(45.0),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+            words = text.split()
+            if len(words) > self.SUMMARY_MAX_WORDS:
+                text = " ".join(words[: self.SUMMARY_MAX_WORDS])
+            return text.strip()
         except Exception:
             return previous  # fail-open: keep the old summary
 
@@ -586,42 +590,42 @@ async def simple_chat_stream(
         "stream": True,
     }
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-        try:
-            async with client.stream(
-                "POST",
-                f"{ai_base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-            ) as resp:
-                if resp.status_code != 200:
-                    error_text = await resp.aread()
-                    yield f"data: {json.dumps({'type': 'text', 'content': f'⚠ API error {resp.status_code}'})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
+    try:
+        async with _SHARED_HTTP.stream(
+            "POST",
+            f"{ai_base_url}/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=httpx.Timeout(120.0),
+        ) as resp:
+            if resp.status_code != 200:
+                error_text = await resp.aread()
+                yield f"data: {json.dumps({'type': 'text', 'content': f'⚠ API error {resp.status_code}'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    choices = chunk.get("choices", [])
+                    if not choices:
                         continue
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            yield f"data: {json.dumps({'type': 'text', 'content': content})}\n\n"
-                        reasoning = delta.get("reasoning_content", "")
-                        if reasoning:
-                            yield f"data: {json.dumps({'type': 'reasoning', 'content': reasoning})}\n\n"
-                    except json.JSONDecodeError:
-                        continue
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield f"data: {json.dumps({'type': 'text', 'content': content})}\n\n"
+                    reasoning = delta.get("reasoning_content", "")
+                    if reasoning:
+                        yield f"data: {json.dumps({'type': 'reasoning', 'content': reasoning})}\n\n"
+                except json.JSONDecodeError:
+                    continue
 
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'text', 'content': f'⚠ Error: {e}'})}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'text', 'content': f'⚠ Error: {e}'})}\n\n"
 
     yield "data: [DONE]\n\n"

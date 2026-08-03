@@ -284,9 +284,6 @@ STORE_PATH.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR = STORE_PATH / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Shared HTTP client — one connection pool for all requests
-_http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
-
 # Initialize auth DB
 auth_db = get_auth_db(STORE_PATH)
 JWT_SECRET = get_jwt_secret(STORE_PATH)
@@ -360,13 +357,17 @@ def _save_assistant_message(session_id: str, content: str, reasoning_content: st
     save_messages(session_id, msgs)
 
 
-def _upsert_session(session_id: str, query: str) -> None:
+def _upsert_session(session_id: str, query: str, owner_id: int | None = None) -> None:
     """Create or update a session entry from a user query."""
     sessions = load_sessions()
     existing = next((s for s in sessions if s["id"] == session_id), None)
     if existing:
         existing["messageCount"] = (existing.get("messageCount", 0) or 0) + 1
         existing["updatedAt"] = int(time.time() * 1000)
+        # Legacy sessions (pre-ownership) get claimed by the first user who
+        # touches them — auto-migrates old data without exposing it to others.
+        if owner_id is not None and existing.get("owner_id") is None:
+            existing["owner_id"] = owner_id
     else:
         sessions.insert(
             0,
@@ -376,9 +377,30 @@ def _upsert_session(session_id: str, query: str) -> None:
                 "messageCount": 1,
                 "createdAt": int(time.time() * 1000),
                 "updatedAt": int(time.time() * 1000),
+                "owner_id": owner_id,
             },
         )
     save_sessions(sessions)
+
+
+def _session_owner_id(session_id: str) -> int | None:
+    """Owner (user_id) of a session, or None if it doesn't exist yet."""
+    for s in load_sessions():
+        if s.get("id") == session_id:
+            return s.get("owner_id")
+    return None
+
+
+def _can_use_session(session_id: str, user_id: int) -> bool:
+    """Ownership gate: a session may be used only by its owner.
+
+    Unknown sessions (not yet in the store) are claimable — the caller
+    creates them, and _upsert_session stamps the owner on creation.
+    Sessions owned by someone else are off-limits (403)."""
+    owner = _session_owner_id(session_id)
+    if owner is None:
+        return True  # new session — caller will create + claim it
+    return owner == user_id
 
 
 def _read_attachment_content(attach_url: str, attach_type: str) -> str:
@@ -572,6 +594,25 @@ async def verify_bearer(request: Request) -> dict:
 PUBLIC_PATHS = {"/health", "/diag", "/auth/register", "/auth/login", "/auth/refresh", "/setup", "/setup/qr", "/setup/connect"}
 
 
+def _uploads_allowed(request: Request, user: dict) -> bool:
+    """Attachment fetch gate: /uploads/<session>/... only for the session owner.
+
+    Runs inside auth_middleware so the static /uploads mount stays behind
+    per-session ownership — an authenticated user cannot fetch another
+    user's attachments by guessing the URL."""
+    path = request.url.path
+    if not path.startswith("/uploads/"):
+        return True
+    parts = path.strip("/").split("/")
+    if len(parts) < 2:
+        return False
+    try:
+        uid = int(user.get("sub", "-1"))
+    except (ValueError, TypeError):
+        uid = -1
+    return _can_use_session(parts[1], uid)
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Skip auth for public paths; enforce for everything else."""
@@ -589,11 +630,15 @@ async def auth_middleware(request: Request, call_next):
     payload = decode_access_token(token, JWT_SECRET)
     if payload:
         request.state.user = payload
+        if not _uploads_allowed(request, payload):
+            return Response(status_code=401, content='{"detail":"Not your attachment"}', media_type="application/json")
         return await call_next(request)
     
     # Fallback: check if it's the static HERMES_API_KEY (backward compat)
     if HERMES_API_KEY and hmac.compare_digest(token, HERMES_API_KEY):
         request.state.user = {"sub": "0", "email": "legacy@api-key", "type": "legacy"}
+        if not _uploads_allowed(request, request.state.user):
+            return Response(status_code=401, content='{"detail":"Not your attachment"}', media_type="application/json")
         return await call_next(request)
     
     # Neither worked
@@ -631,6 +676,12 @@ def _auth_rate_limited(request: Request) -> bool:
     ip = _client_ip(request)
     now = time.time()
     with _auth_attempts_lock:
+        # Opportunistic purge: bounds the dict (an IP that never returns
+        # would otherwise leave its entry forever).
+        if len(_auth_attempts) > 10_000:
+            for k, v in list(_auth_attempts.items()):
+                if not [t for t in v if now - t < AUTH_RATE_WINDOW]:
+                    _auth_attempts.pop(k, None)
         hits = [t for t in _auth_attempts.get(ip, []) if now - t < AUTH_RATE_WINDOW]
         if len(hits) >= AUTH_RATE_LIMIT:
             _auth_attempts[ip] = hits
@@ -820,20 +871,23 @@ async def diag(request: Request):
 
 @app.get("/api/sessions")
 async def list_sessions(user: dict = Depends(verify_bearer)):
-    """List all chat sessions for the authenticated user."""
-    return load_sessions()
+    """List chat sessions for the authenticated user (owner-scoped)."""
+    uid = int(user["sub"])
+    return [s for s in load_sessions() if s.get("owner_id") == uid]
 
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
-    """Delete a session and its messages."""
-    sessions = load_sessions()
-    sessions = [s for s in sessions if s.get("id") != session_id]
+    """Delete a session and its messages (owner-scoped)."""
+    uid = int(user["sub"])
+    if not _can_use_session(session_id, uid):
+        return JSONResponse(status_code=403, content={"detail": "Not your session"})
+    sessions = [s for s in load_sessions() if s.get("id") != session_id]
     save_sessions(sessions)
     msgs_path = _messages_path(session_id)
     if msgs_path.exists():
         msgs_path.unlink()
-    logger.info(f"Deleted session {session_id} for user {user['sub']}")
+    logger.info("Deleted session %s for user %s", session_id, user["sub"])
     return {"status": "ok", "deleted": session_id}
 
 
@@ -1396,6 +1450,9 @@ def _fetch_models_sync(session_id: str) -> dict:
 async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     """Streaming chat endpoint with full agent tool execution."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
+    uid = int(user["sub"])
+    if not _can_use_session(session_id, uid):
+        return JSONResponse(status_code=403, content={"detail": "Not your session"})
 
     # Reject empty queries (but allow if attachment is present)
     has_attachment = bool(body.attachment_url and body.attachment_url.strip())
@@ -1410,7 +1467,7 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
         query = "[User attached a file without text]"
 
     _save_user_message(session_id, query, body.attachment_url or "", body.attachment_type or "")
-    _upsert_session(session_id, query)
+    _upsert_session(session_id, query, uid)
 
     # ─── Pre-check for special commands (model switch, etc.) ───
     handled, cmd_response = _handle_special_command(query, session_id)
@@ -1507,9 +1564,12 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
 async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     """Non-streaming chat endpoint with full agent tool execution."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
+    uid = int(user["sub"])
+    if not _can_use_session(session_id, uid):
+        return JSONResponse(status_code=403, content={"detail": "Not your session"})
 
     _save_user_message(session_id, body.query)
-    _upsert_session(session_id, body.query)
+    _upsert_session(session_id, body.query, uid)
 
     # ─── Pre-check for special commands (model switch, etc.) ───
     handled, cmd_response = _handle_special_command(body.query, session_id)
@@ -1603,6 +1663,10 @@ async def upload_file(
     # Path-traversal guard: session_id must be a plain identifier (no separators)
     if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id or ""):
         raise HTTPException(status_code=400, detail="Invalid session_id")
+
+    # Ownership gate: can't upload into another user's session.
+    if not _can_use_session(session_id, user_id):
+        raise HTTPException(status_code=403, detail="Not your session")
 
     # Ensure the session subdirectory exists
     session_upload_dir = UPLOADS_DIR / session_id

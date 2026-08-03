@@ -160,30 +160,31 @@ class AuthDB:
 
     def verify_refresh_token(self, raw_token: str) -> Optional[int]:
         """Verify a refresh token. Returns user_id if valid, None otherwise.
-        Implements rotation: on success, DELETES the old token."""
+        Implements rotation atomically: DELETE ... RETURNING in ONE statement
+        closes the replay race — two concurrent requests with the same token
+        cannot both pass (the second sees zero rows)."""
         conn = self._get_conn()
         token_hash = self._hash_token(raw_token)
         now = int(time.time())
 
+        # Purge expired tokens for this hash (dead tokens — no race concern).
+        conn.execute(
+            "DELETE FROM refresh_tokens WHERE token_hash = ? AND expires_at < ?",
+            (token_hash, now),
+        )
+        # Atomic rotation: delete-and-return in ONE statement closes the
+        # replay race — two concurrent requests with the same token cannot
+        # both pass (the second sees zero rows).
         row = conn.execute(
-            "SELECT user_id, expires_at FROM refresh_tokens WHERE token_hash = ?",
-            (token_hash,),
+            "DELETE FROM refresh_tokens WHERE token_hash = ? AND expires_at >= ? "
+            "RETURNING user_id",
+            (token_hash, now),
         ).fetchone()
+        conn.commit()
 
         if not row:
             return None
-
-        user_id, expires_at = row
-        if expires_at < now:
-            # Expired — delete and return None
-            conn.execute("DELETE FROM refresh_tokens WHERE token_hash = ?", (token_hash,))
-            conn.commit()
-            return None
-
-        # Valid — ROTATE: delete old, caller will create new
-        conn.execute("DELETE FROM refresh_tokens WHERE token_hash = ?", (token_hash,))
-        conn.commit()
-        return user_id
+        return row[0]
 
     def revoke_all_refresh_tokens(self, user_id: int) -> None:
         """Log out user from all devices."""
