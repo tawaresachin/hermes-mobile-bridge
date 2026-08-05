@@ -161,8 +161,14 @@ class SearchFiles(BaseTool):
                         cmd.extend(["-g", file_glob])
                     cmd.extend([pattern, str(search_path)])
                 else:
-                    cmd = ["grep", "-rn", "--include=" + file_glob if file_glob else "",
-                           pattern, str(search_path)]
+                    # Note: `"--include=" + glob if glob else ""` would
+                    # inject an EMPTY arg when glob is unset, shifting
+                    # `pattern` into the path position and breaking the
+                    # search — build the arg list conditionally instead.
+                    cmd = ["grep", "-rn"]
+                    if file_glob:
+                        cmd.append("--include=" + file_glob)
+                    cmd.extend([pattern, str(search_path)])
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=30,
                 )
