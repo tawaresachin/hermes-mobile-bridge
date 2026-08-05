@@ -1341,6 +1341,17 @@ def _models_save_to_disk() -> None:
         logger.warning("models cache save failed: %s", e)
 
 
+def _rebuild_provider_maps(models: list[dict]) -> None:
+    """(Re)build model→baseUrl and model→apiKey maps from a models list.
+    Keys resolve at runtime from config/env — nothing hardcoded."""
+    for m in models:
+        if m.get("baseUrl"):
+            _model_base_url_map[m["id"]] = m["baseUrl"]
+            key = _runtime_key_for_base_url(m["baseUrl"])
+            if key:
+                _model_api_key_map[m["id"]] = key
+
+
 def _models_load_from_disk() -> None:
     global _models_cache, _models_cache_ts
     try:
@@ -1348,6 +1359,12 @@ def _models_load_from_disk() -> None:
             data = json.loads(_MODELS_CACHE_FILE.read_text())
             _models_cache = data.get("models", {}) or {}
             _models_cache_ts = float(data.get("ts", 0.0))
+            # CRITICAL: also rebuild the provider maps NOW — otherwise a chat
+            # request in the seconds between boot and the background refresh
+            # falls back to the DEFAULT API key and gets 401 from the
+            # session's provider (seen live: Agnes 'Invalid API key' right
+            # after a restart).
+            _rebuild_provider_maps(list(_models_cache.values()))
             logger.info("Loaded %d models from disk cache", len(_models_cache))
     except Exception as e:
         logger.warning("models cache load failed: %s", e)
@@ -1548,12 +1565,7 @@ def _fetch_models_sync(session_id: str) -> dict:
 
     # Build base URL + API key maps for provider-aware switching.
     # Keys resolve at runtime from config/env — nothing hardcoded.
-    for m in models:
-        if m.get("baseUrl"):
-            _model_base_url_map[m["id"]] = m["baseUrl"]
-            key = _runtime_key_for_base_url(m["baseUrl"])
-            if key:
-                _model_api_key_map[m["id"]] = key
+    _rebuild_provider_maps(models)
 
     current = _session_model_overrides.get(session_id, AI_MODEL)
     return {
