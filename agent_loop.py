@@ -43,6 +43,26 @@ def _hermes_compression() -> dict:
 # (simple_chat_stream etc.). Per-request clients leak fds/connections.
 _SHARED_HTTP = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
 
+# Per-request AgentLoop instances share ONE long-lived client (the old code
+# created a fresh AsyncClient per turn and never closed it — connection
+# pools/fds accumulated until GC). 300s matches the original per-request
+# timeout; the connection pool is reused across turns.
+_LOOP_CLIENT: httpx.AsyncClient | None = None
+
+
+def _get_shared_client() -> httpx.AsyncClient:
+    global _LOOP_CLIENT
+    if _LOOP_CLIENT is None or _LOOP_CLIENT.is_closed:
+        _LOOP_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
+    return _LOOP_CLIENT
+
+
+# Module-level per-session summary locks. AgentLoop is constructed per
+# request, so instance-level locks never actually serialized anything —
+# two concurrent turns on one session raced read→summarise→write on the
+# summary file. Keyed by session_id, bounded below.
+_SUMMARY_LOCKS: dict[str, asyncio.Lock] = {}
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
     "You are helpful, knowledgeable, and direct. "
@@ -166,9 +186,9 @@ class AgentLoop:
         self.ai_model = ai_model
         self.system_prompt = system_prompt
         self.tools = tools or registry
-        self._http = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
-        # Per-session locks so concurrent turns can't race on the summary file
-        self._summary_locks: dict[str, asyncio.Lock] = {}
+        # Shared client — one per process, NOT one per AgentLoop instance.
+        # (Per-request clients leaked connection pools/fds on every turn.)
+        self._http = _get_shared_client()
         # Context "headroom" tuning — env-forced at setup, always-on defaults.
         # Enforce Hermes Agent's OWN compression as the per-session default
         # (protect_last_n, threshold, target_ratio) so every app session keeps
@@ -406,7 +426,7 @@ class AgentLoop:
         older = messages[:cutoff]
         recent = messages[cutoff:]
 
-        lock = self._summary_locks.setdefault(session_id, asyncio.Lock())
+        lock = _SUMMARY_LOCKS.setdefault(session_id, asyncio.Lock())
         async with lock:  # serialise read→summarise→write per session
             summary, count = self._load_summary_state(session_id)
             new_batch = older[count:]
@@ -420,8 +440,8 @@ class AgentLoop:
                 self._save_summary_state(session_id, summary, len(older))
         # Bound the lock map (dicts preserve insertion order — drop the oldest
         # entries once it gets large; active sessions re-create their lock).
-        if len(self._summary_locks) > 256:
-            self._summary_locks = dict(list(self._summary_locks.items())[-128:])
+        if len(_SUMMARY_LOCKS) > 256:
+            _SUMMARY_LOCKS.clear()
 
         if not summary:
             # Nothing summarised yet — keep a trimmed tail rather than drop
@@ -459,6 +479,35 @@ class AgentLoop:
         }
 
         try:
+            accumulated_tool_calls: dict[int, dict] = {}
+
+            def _flush_accumulated_tool_calls() -> list[dict]:
+                """Emit fully-accumulated native tool calls as events.
+                Only complete calls (with a function name) are flushed —
+                a partial call cut off mid-stream is dropped rather than
+                executed with garbage arguments."""
+                events: list[dict] = []
+                for tc_data in accumulated_tool_calls.values():
+                    fn = tc_data.get("function", {})
+                    fn_name = fn.get("name", "")
+                    if not fn_name:
+                        continue
+                    tc_id = tc_data.get("id", str(uuid.uuid4())[:8])
+                    fn_args_str = fn.get("arguments", "{}")
+                    try:
+                        fn_args = json.loads(fn_args_str) if isinstance(fn_args_str, str) else fn_args_str
+                    except json.JSONDecodeError:
+                        fn_args = {}
+                    events.append({
+                        "type": "tool_call",
+                        "tool_call": ToolCall(
+                            id=tc_id,
+                            name=fn_name,
+                            arguments=fn_args,
+                        ),
+                    })
+                return events
+
             async with self._http.stream(
                 "POST",
                 f"{self.ai_base_url}/chat/completions",
@@ -472,7 +521,7 @@ class AgentLoop:
 
                 # Accumulate tool call deltas across chunks
                 # Keyed by index, each is {id, function: {name, arguments}}
-                accumulated_tool_calls: dict[int, dict] = {}
+                done_received = False
 
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
@@ -480,23 +529,9 @@ class AgentLoop:
                     data_str = line[6:].strip()
                     if data_str == "[DONE]":
                         # Emit any fully accumulated tool calls before finishing
-                        for tc_data in accumulated_tool_calls.values():
-                            tc_id = tc_data.get("id", str(uuid.uuid4())[:8])
-                            fn = tc_data.get("function", {})
-                            fn_name = fn.get("name", "unknown")
-                            fn_args_str = fn.get("arguments", "{}")
-                            try:
-                                fn_args = json.loads(fn_args_str) if isinstance(fn_args_str, str) else fn_args_str
-                            except json.JSONDecodeError:
-                                fn_args = {}
-                            yield {
-                                "type": "tool_call",
-                                "tool_call": ToolCall(
-                                    id=tc_id,
-                                    name=fn_name,
-                                    arguments=fn_args,
-                                ),
-                            }
+                        for ev in _flush_accumulated_tool_calls():
+                            yield ev
+                        done_received = True
                         break
                     try:
                         chunk = json.loads(data_str)
@@ -544,6 +579,13 @@ class AgentLoop:
 
                     except json.JSONDecodeError:
                         continue
+
+                # EOF without the [DONE] sentinel (some providers just close
+                # the stream) — flush accumulated tool calls so a tool request
+                # isn't silently dropped.
+                if not done_received:
+                    for ev in _flush_accumulated_tool_calls():
+                        yield ev
 
         except Exception as e:
             yield {"type": "error", "content": f"Connection error: {e}"}

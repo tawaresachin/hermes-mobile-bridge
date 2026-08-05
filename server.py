@@ -22,6 +22,9 @@ import subprocess
 import sys
 import threading
 import time
+import concurrent.futures as _cf
+# Shared executor for TTS worker pipe reads (see _read_exact deadlock note).
+_TTS_READ_POOL = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="tts-read")
 import urllib.request
 import uuid
 from pathlib import Path
@@ -60,7 +63,7 @@ if _env_path.exists():
             _val = _val.strip("\"'")
             if _key not in os.environ:
                 os.environ[_key] = _val
-            logger.info("Loaded .env: %s=%s...", _key, _val[:8] + "..." if len(_val) > 8 else _val)
+            logger.info("Loaded .env: %s", _key)
 else:
     logger.info("No .env file found at %s", _env_path)
 
@@ -530,7 +533,10 @@ def _build_openai_messages(session_id: str) -> list[dict]:
     Does NOT include a system prompt — AgentLoop adds its own."""
     msgs = load_messages(session_id)
     result = []
-    for m in msgs[-20:]:
+    # Full history — AgentLoop.run() compacts it (rolling summary + recent
+    # window). Slicing to 20 here starved the compaction and silently
+    # dropped everything beyond the last 20 messages in long sessions.
+    for m in msgs:
         content = m["content"]
         attach_url = m.get("attachment_url", "")
         attach_type = m.get("attachment_type", "")
@@ -715,11 +721,17 @@ AUTH_RATE_WINDOW = 900        # 15 minutes
 
 
 def _client_ip(request: Request) -> str:
-    """Client IP — honour X-Forwarded-For (Cloudflare tunnel) with fallback."""
-    xff = request.headers.get("x-forwarded-for", "")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Client IP — honour X-Forwarded-For ONLY when the direct peer is
+    loopback (i.e. the request arrived via the local cloudflared tunnel,
+    which sets the header itself). External clients connecting straight
+    to the server can spoof X-Forwarded-For — never trust it then, or the
+    auth rate limit is trivially bypassed by rotating the header."""
+    peer = request.client.host if request.client else "unknown"
+    if peer in ("127.0.0.1", "::1"):
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[0].strip()
+    return peer
 
 
 def _auth_rate_limited(request: Request) -> bool:
@@ -902,7 +914,7 @@ async def health():
 @app.get("/diag")
 async def diag(request: Request):
     """Diagnostic page — open this in a browser on your phone to test connectivity."""
-    real_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown")
+    real_ip = _client_ip(request)
     return {
         "status": "ok",
         "message": "Hermes Mobile Bridge is reachable from your phone! ✅",
@@ -1091,21 +1103,23 @@ class _EdgeTtsWorker:
         assert r is not None, "worker not spawned"
         # Thread-based read with timeout — works on Windows too
         # (select() on pipes is POSIX-only).
-        from concurrent.futures import ThreadPoolExecutor
+        # Module-level shared pool: the OLD code created a pool per call and
+        # its `with`-exit ran shutdown(wait=True), which blocks FOREVER on a
+        # still-pending blocking os.read after a timeout — while holding the
+        # global _lock. One hung edge-tts worker wedged ALL TTS permanently.
         buf = b""
         deadline = time.monotonic() + timeout
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            while len(buf) < n:
-                remaining = max(0.1, deadline - time.monotonic())
-                try:
-                    chunk = pool.submit(
-                        lambda: os.read(r.fileno(), n - len(buf))
-                    ).result(timeout=remaining)
-                except Exception:
-                    raise TimeoutError("TTS worker read timeout") from None
-                if not chunk:
-                    raise EOFError("TTS worker closed")
-                buf += chunk
+        while len(buf) < n:
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                chunk = _TTS_READ_POOL.submit(
+                    lambda: os.read(r.fileno(), n - len(buf))
+                ).result(timeout=remaining)
+            except Exception:
+                raise TimeoutError("TTS worker read timeout") from None
+            if not chunk:
+                raise EOFError("TTS worker closed")
+            buf += chunk
         return buf
 
     def synth(self, text: str, voice: str, timeout: float = 60.0) -> bytes:
@@ -1251,9 +1265,16 @@ async def text_to_speech(body: TtsRequest, user: dict = Depends(verify_bearer)):
         fpath = cache_dir / f"{cache_key}.mp3"
         fpath.write_bytes(audio)
         _tts_cache[cache_key] = str(fpath)
-        # Bound the cache dict (memory hygiene)
+        # Bound the cache dict (memory hygiene) — delete the evicted FILE
+        # too, otherwise STORE_PATH grows unbounded (mp3s were never
+        # removed, only the dict entry).
         if len(_tts_cache) > 100:
-            _tts_cache.pop(next(iter(_tts_cache)))
+            evicted_key = next(iter(_tts_cache))
+            evicted_path = _tts_cache.pop(evicted_key)
+            try:
+                Path(evicted_path).unlink(missing_ok=True)
+            except Exception:
+                pass
     except Exception:
         pass  # cache is best-effort
 
@@ -1330,6 +1351,7 @@ async def speech_to_text(request: Request, lang: str = "", user: dict = Depends(
 _models_cache: dict = {}
 _models_cache_ts: float = 0.0
 _models_lock = threading.Lock()
+_MODEL_REFRESH_INFLIGHT = False  # single-flight guard for background refresh
 _MODELS_CACHE_FILE = STORE_PATH / "models_cache.json"
 
 
@@ -1371,8 +1393,14 @@ def _models_load_from_disk() -> None:
 
 
 def _refresh_models_background(session_id: str) -> None:
-    """Thread worker: refetch models, update cache + disk. Never blocks a request."""
+    """Thread worker: refetch models, update cache + disk. Never blocks a request.
+    Single-flight: if a refresh is already running, skip (N concurrent stale
+    /api/models calls used to spawn N provider fetches)."""
     global _models_cache_ts
+    with _models_lock:
+        if _MODEL_REFRESH_INFLIGHT:
+            return
+        _MODEL_REFRESH_INFLIGHT = True
     try:
         result = _fetch_models_sync(session_id)
         if result:
@@ -1384,6 +1412,9 @@ def _refresh_models_background(session_id: str) -> None:
             logger.info("Background model refresh: %d models", len(result))
     except Exception as e:
         logger.warning("background model refresh failed: %s", e)
+    finally:
+        with _models_lock:
+            _MODEL_REFRESH_INFLIGHT = False
 
 
 @app.get("/api/models")
@@ -1731,7 +1762,7 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     error_msg = None
 
     try:
-        async for event in loop.run(openai_messages, body.query):
+        async for event in loop.run(openai_messages, body.query, session_id=session_id):
             # Try to parse every SSE data event (cover both text and error types)
             if event.startswith('data: {'):
                 try:
@@ -2500,4 +2531,4 @@ if __name__ == "__main__":
         _open_browser_best_effort(f"http://{_setup_ip}:{PORT}/setup?token={SETUP_TOKEN}")
     except Exception:
         pass
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info", access_log=False)
