@@ -1358,7 +1358,16 @@ _MODELS_CACHE_FILE = STORE_PATH / "models_cache.json"
 def _models_save_to_disk() -> None:
     try:
         _MODELS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _MODELS_CACHE_FILE.write_text(json.dumps({"ts": _models_cache_ts, "models": _models_cache}))
+        # Flatten to {ts, models: <list>, current, default, provider} — the
+        # same shape the loader normalizes; never nest the response dict.
+        models_list = _normalize_models(_models_cache.get("models", []))
+        _MODELS_CACHE_FILE.write_text(json.dumps({
+            "ts": _models_cache_ts,
+            "models": models_list,
+            "current": _models_cache.get("current", AI_MODEL),
+            "default": _models_cache.get("default", AI_MODEL),
+            "provider": _models_cache.get("provider", ""),
+        }))
     except Exception as e:
         logger.warning("models cache save failed: %s", e)
 
@@ -1374,20 +1383,55 @@ def _rebuild_provider_maps(models: list[dict]) -> None:
                 _model_api_key_map[m["id"]] = key
 
 
+def _normalize_models(raw) -> list[dict]:
+    """Extract a flat list of model dicts from ANY cache shape:
+    list, dict-of-dicts, or the response dict {models: [...], ...}."""
+    if isinstance(raw, list):
+        return [m for m in raw if isinstance(m, dict)]
+    if isinstance(raw, dict):
+        if isinstance(raw.get("models"), list):
+            return [m for m in raw["models"] if isinstance(m, dict)]
+        return [m for m in raw.values() if isinstance(m, dict)]
+    return []
+
+
 def _models_load_from_disk() -> None:
     global _models_cache, _models_cache_ts
     try:
         if _MODELS_CACHE_FILE.exists():
             data = json.loads(_MODELS_CACHE_FILE.read_text())
-            _models_cache = data.get("models", {}) or {}
-            _models_cache_ts = float(data.get("ts", 0.0))
+            if isinstance(data, dict):
+                models_raw = data.get("models", [])
+                _models_cache_ts = float(data.get("ts", 0.0))
+                # current/default/provider may sit at the TOP level (old
+                # flattened files) or INSIDE the nested response dict.
+                nested = models_raw if isinstance(models_raw, dict) else {}
+                current = data.get("current") or nested.get("current") or AI_MODEL
+                default = data.get("default") or nested.get("default") or AI_MODEL
+                provider = data.get("provider") or nested.get("provider") or ""
+            elif isinstance(data, list):
+                models_raw, _models_cache_ts = data, 0.0
+                current = default = AI_MODEL
+                provider = ""
+            else:
+                models_raw, _models_cache_ts = [], 0.0
+                current = default = AI_MODEL
+                provider = ""
+            models_list = _normalize_models(models_raw)
+            _models_cache = {
+                "models": models_list,
+                "current": current,
+                "default": default,
+                "provider": provider,
+            }
             # CRITICAL: also rebuild the provider maps NOW — otherwise a chat
             # request in the seconds between boot and the background refresh
-            # falls back to the DEFAULT API key and gets 401 from the
-            # session's provider (seen live: Agnes 'Invalid API key' right
-            # after a restart).
-            _rebuild_provider_maps(list(_models_cache.values()))
-            logger.info("Loaded %d models from disk cache", len(_models_cache))
+            # falls back to the DEFAULT API key/base URL and gets 401/400
+            # from the session's provider (seen live twice: Agnes 401 after
+            # restart, then the local gateway's 'Unable to determine
+            # provider' 400).
+            _rebuild_provider_maps(models_list)
+            logger.info("Loaded %d models from disk cache", len(models_list))
     except Exception as e:
         logger.warning("models cache load failed: %s", e)
 
@@ -1396,7 +1440,7 @@ def _refresh_models_background(session_id: str) -> None:
     """Thread worker: refetch models, update cache + disk. Never blocks a request.
     Single-flight: if a refresh is already running, skip (N concurrent stale
     /api/models calls used to spawn N provider fetches)."""
-    global _models_cache_ts
+    global _models_cache_ts, _MODEL_REFRESH_INFLIGHT
     with _models_lock:
         if _MODEL_REFRESH_INFLIGHT:
             return
