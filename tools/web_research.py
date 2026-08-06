@@ -30,9 +30,9 @@ from tools.web import _decode_ddg_url
 # ─── Constants ───────────────────────────────────────────────────────────
 
 NEWS_FEEDS = [
-    ("BBC", "https://feeds.bbci.co.uk/news/rss.xml", True),
-    ("Guardian", "https://www.theguardian.com/world/rss", True),
-    ("NYT", "https://feeds.nytimes.com/nyt/rss/HomePage.xml", True),
+    ("BBC", "https://feeds.bbci.co.uk/news/rss.xml"),
+    ("Guardian", "https://www.theguardian.com/world/rss"),
+    ("NYT", "https://feeds.nytimes.com/nyt/rss/HomePage.xml"),
 ]
 GNEWS_URL = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 DDG_URL = "https://html.duckduckgo.com/html/?q={q}"
@@ -371,7 +371,7 @@ class WebResearch(BaseTool):
             asyncio.create_task(run_one("ddg", self._ddg_search(query))),
             asyncio.create_task(run_one("gnews", self._gnews_search(query))),
         ]
-        for name, url, _use in NEWS_FEEDS:
+        for name, url in NEWS_FEEDS:
             tasks.append(asyncio.create_task(run_one(name, self._fetch_feed(name, url, query))))
         await asyncio.wait_for(asyncio.gather(*tasks), STAGE1_TIMEOUT)
         return results
@@ -478,6 +478,11 @@ class WebResearch(BaseTool):
         return out
 
     async def _extract_article(self, url: str) -> ExtractResult:
+        # SSRF guard: only public http(s) targets — never localhost, the
+        # OmniRoute gateway, Tailscale/CGNAT, or RFC1918 ranges.
+        from tools.web import is_safe_url
+        if not is_safe_url(url):
+            return ExtractResult(url=url, title="", text="", error="blocked non-public URL")
         try:
             async with self._client.stream("GET", url, headers=_UA_HEADERS) as resp:
                 if resp.status_code != 200:

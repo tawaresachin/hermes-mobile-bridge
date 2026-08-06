@@ -110,8 +110,9 @@ def _get_provider_key() -> str:
     Order: server's AI_API_KEY → OmniRoute key env → HF token.
     """
     key = os.environ.get("AI_API_KEY", "") or os.environ.get("HERMES_API_KEY", "")
-    if key and key != "hermes123":  # skip the static bridge key — it's not a provider key
-        return key
+    if key:  # the static bridge key is not a provider key — skip if it equals it
+        if key != os.environ.get("BRIDGE_STATIC_KEY", "hermes123"):
+            return key
     or_key = os.environ.get("HERMES_CUSTOM_LOCALHOST_20128_API_KEY", "")
     if or_key:
         return or_key
@@ -896,7 +897,7 @@ def load_project_rules() -> str:
 _sysprompt_cache: tuple[float, str, str] | None = None  # (ts, base_prompt, prompt)
 
 
-def build_system_prompt(base_prompt: str, session_dir: str = "") -> str:
+def build_system_prompt(base_prompt: str) -> str:
     """Assemble the complete system prompt: base + skills + rules.
 
     Cached for 30s (keyed by base_prompt) — the pieces (skills, personality,

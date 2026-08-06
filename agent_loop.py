@@ -39,10 +39,6 @@ def _hermes_compression() -> dict:
         pass
     return comp
 
-# Shared HTTP client — ONE connection pool for all module-level streams
-# (simple_chat_stream etc.). Per-request clients leak fds/connections.
-_SHARED_HTTP = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
-
 # Per-request AgentLoop instances share ONE long-lived client (the old code
 # created a fresh AsyncClient per turn and never closed it — connection
 # pools/fds accumulated until GC). 300s matches the original per-request
@@ -196,7 +192,6 @@ class AgentLoop:
         _headroom = _hermes_compression()
         self.recent_k = int(os.getenv("CONTEXT_RECENT_K", str(_headroom["protect_last_n"])))
         self.summary_batch = int(os.getenv("CONTEXT_SUMMARY_BATCH", str(AgentLoop.SUMMARY_BATCH)))
-        self.comp_target_ratio = float(os.getenv("CONTEXT_TARGET_RATIO", str(_headroom["target_ratio"])))
         # Caveman style: forced ON by the server (CAVEMAN_STYLE=1 written at
         # setup). Set 0 only to disable explicitly.
         self.caveman_style = os.getenv("CAVEMAN_STYLE", "1").lower() not in ("0", "false", "no", "off")
@@ -219,14 +214,18 @@ class AgentLoop:
             yield sse_done()
             return
 
-        handled, cmd_response = handle_command(query, session_id)
+        # Handle special commands (sessions/config/model). Runs hermes-CLI
+        # subprocesses (up to 15s) — keep them off the event loop.
+        handled, cmd_response = await asyncio.to_thread(handle_command, query, session_id)
         if handled and cmd_response:
             yield sse_text(cmd_response)
             yield sse_done()
             return
 
-        # Build enhanced system prompt with skills, commands, and rules
-        enhanced_prompt = build_system_prompt(self.system_prompt)
+        # Build enhanced system prompt with skills, commands, and rules.
+        # Runs skills-loading subprocesses (up to 30s on cold cache) — must
+        # NOT block the event loop, so hop to a worker thread.
+        enhanced_prompt = await asyncio.to_thread(build_system_prompt, self.system_prompt)
         # Caveman style — server-forced (CAVEMAN_STYLE=1 at setup): short
         # replies save tokens on every turn and keep voice TTS crisp.
         if self.caveman_style:
@@ -608,66 +607,3 @@ class AgentLoop:
             except (json.JSONDecodeError, KeyError):
                 continue
         return calls
-
-
-# For backward compatibility: simple streaming without tool loop
-async def simple_chat_stream(
-    messages: list[dict],
-    ai_base_url: str,
-    ai_api_key: str,
-    ai_model: str,
-    system_prompt: str = "You are Hermes, a helpful AI assistant. Be concise and accurate.",
-) -> AsyncGenerator[str, None]:
-    """Simple SSE streaming without tool execution (original behavior)."""
-    headers = {"Content-Type": "application/json"}
-    if ai_api_key:
-        headers["Authorization"] = f"Bearer {ai_api_key}"
-
-    payload = {
-        "model": ai_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            *messages,
-        ],
-        "stream": True,
-    }
-
-    try:
-        async with _SHARED_HTTP.stream(
-            "POST",
-            f"{ai_base_url}/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=httpx.Timeout(120.0),
-        ) as resp:
-            if resp.status_code != 200:
-                error_text = await resp.aread()
-                yield f"data: {json.dumps({'type': 'text', 'content': f'⚠ API error {resp.status_code}'})}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    choices = chunk.get("choices", [])
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        yield f"data: {json.dumps({'type': 'text', 'content': content})}\n\n"
-                    reasoning = delta.get("reasoning_content", "")
-                    if reasoning:
-                        yield f"data: {json.dumps({'type': 'reasoning', 'content': reasoning})}\n\n"
-                except json.JSONDecodeError:
-                    continue
-
-    except Exception as e:
-        yield f"data: {json.dumps({'type': 'text', 'content': f'⚠ Error: {e}'})}\n\n"
-
-    yield "data: [DONE]\n\n"

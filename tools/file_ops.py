@@ -2,13 +2,12 @@
 """File system tools — read, write, search, and patch files."""
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
 from pathlib import Path
 
-from tools import BaseTool, MAX_TOOL_OUTPUT_CHARS
+from tools import BaseTool
 
 WORK_DIR = Path(os.getenv("AGENT_WORK_DIR", os.path.expanduser("~")))
 

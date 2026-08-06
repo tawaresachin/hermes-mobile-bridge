@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import html as html_mod
-import json
+import ipaddress
 import re
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
@@ -12,6 +12,38 @@ import httpx
 from tools import BaseTool
 
 _http = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+
+
+def is_safe_url(url: str) -> bool:
+    """SSRF guard: only http(s) to PUBLIC hosts.
+
+    Blocks loopback, link-local, multicast, CGNAT (Tailscale 100.64/10)
+    and RFC1918 private ranges. Hostnames are allowed (DNS-rebinding is
+    accepted residual risk for a personal bridge); IP literals in blocked
+    ranges are rejected outright. Also rejects localhost/*.local names."""
+    try:
+        u = urlparse(url)
+        if u.scheme not in ("http", "https"):
+            return False
+        host = (u.hostname or "").lower()
+        if not host:
+            return False
+        if host == "localhost" or host.endswith(".local") or host.endswith(".localdomain"):
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return True  # hostname — allow
+        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+            return False
+        if ip.is_private or ip.is_reserved:
+            return False
+        # Tailscale CGNAT range (also private in modern Python — belt & braces)
+        if ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10"):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _decode_ddg_url(href: str) -> str:
@@ -110,15 +142,26 @@ class WebExtract(BaseTool):
     }
 
     async def run(self, url: str) -> str:
+        if not is_safe_url(url):
+            return "⚠ Refusing to fetch non-public URL (blocked private/loopback host)"
         try:
-            resp = await _http.get(url, headers={
+            async with _http.stream("GET", url, headers={
                 "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
                 "Accept": "text/html,application/xhtml+xml",
-            })
-            if resp.status_code != 200:
-                return f"⚠ Failed to fetch: HTTP {resp.status_code}"
-
-            html = resp.text
+            }) as resp:
+                if resp.status_code != 200:
+                    return f"⚠ Failed to fetch: HTTP {resp.status_code}"
+                # Byte-cap the download (1.5 MB) — a huge page must not
+                # flood memory.
+                chunks = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > 1_500_000:
+                        chunks.append(b"[content too large - truncated]")
+                        break
+                    chunks.append(chunk)
+                html = b"".join(chunks).decode("utf-8", errors="replace")
 
             # Strip HTML tags for basic readability
             text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)

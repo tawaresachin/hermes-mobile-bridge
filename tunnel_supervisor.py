@@ -27,7 +27,6 @@ from pathlib import Path
 STORE_PATH = Path.home() / ".hermes-mobile-server"
 URL_FILE = STORE_PATH / ".current_tunnel_url"
 URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
-URL_HEALTH_CHECK_RE = re.compile(r"trycloudflare\.com")
 
 logger = None  # replaced in main()
 

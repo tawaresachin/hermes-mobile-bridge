@@ -10,13 +10,12 @@ on Linux, macOS, Windows and Android/Termux:
 Idempotent and safe to re-run at any time:
 
   Fresh machine  -> installs the Hermes plugin, bootstraps the server, starts it
-  Existing setup -> updates the plugin (--force reinstall), git-pulls the server, restarts it
+  Existing setup -> updates the plugin, git-pulls the server, restarts it
 
 Options:
     --no-serve   Install/update only — do not start the server.
     --no-stt     Skip whisper STT (binary + ~141MB model). Default: ON —
                  one command installs a COMPLETE server with voice STT.
-    --force      Force-reinstall the Hermes plugin (update path).
     --dir DIR    Server checkout directory (default ~/hermes-mobile-server).
     --help       Show this help.
 
@@ -72,7 +71,7 @@ def step_hermes() -> str | None:
     return hermes
 
 
-def step_install_plugin(hermes: str, force: bool) -> None:
+def step_install_plugin(hermes: str) -> None:
     """Install or update the Hermes plugin (idempotent, subdir-aware).
 
     Always force-reinstalls: Hermes subdir installs keep no .git, so
@@ -86,7 +85,7 @@ def step_install_plugin(hermes: str, force: bool) -> None:
     say("✓ plugin installed/enabled")
 
 
-def step_server(bridge_dir: Path, force_plugin: bool) -> None:
+def step_server(bridge_dir: Path) -> None:
     """Clone or git-pull the server checkout (install vs update)."""
     if (bridge_dir / "server.py").exists():
         say(f"→ Server: updating {bridge_dir}")
@@ -166,7 +165,6 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Hermes Mobile Bridge installer/updater")
     ap.add_argument("--no-serve", action="store_true", help="install/update only")
     ap.add_argument("--no-stt", action="store_true", help="skip whisper STT (binary + ~141MB model)")
-    ap.add_argument("--force", action="store_true", help="force-reinstall the plugin (update)")
     ap.add_argument("--dir", default=str(Path.home() / "hermes-mobile-server"), help="server checkout dir")
     ap.add_argument("--port", default="", help="server port override")
     args = ap.parse_args()
@@ -182,12 +180,12 @@ def main() -> None:
 
     hermes = step_hermes()
     if hermes:
-        step_install_plugin(hermes, args.force)
+        step_install_plugin(hermes)
     else:
         say("→ Hermes CLI not found — standalone mode (server only)")
         say("  Tip: install Hermes to get `hermes mobile-serve` + auto-updates.")
 
-    step_server(bridge_dir, args.force)
+    step_server(bridge_dir)
 
     if not args.no_stt:
         step_stt(bridge_dir)

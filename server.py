@@ -30,7 +30,6 @@ import uuid
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
-import httpx
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, Depends, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -341,6 +340,12 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 # Initialize auth DB
 auth_db = get_auth_db(STORE_PATH)
 JWT_SECRET = get_jwt_secret(STORE_PATH)
+# Sweep expired refresh tokens at boot — otherwise the table grows forever
+# (every login/refresh inserts; only the presented token is deleted).
+try:
+    auth_db.cleanup_expired_tokens()
+except Exception as _e:
+    logger.warning("refresh-token cleanup failed at boot: %s", _e)
 
 # ─── Data store (sessions & messages) ────────────────────────────────────
 
@@ -457,9 +462,15 @@ def _can_use_session(session_id: str, user_id: int) -> bool:
     return owner == user_id
 
 
+_ATTACH_TEXT_CACHE: dict[str, tuple[float, int, str]] = {}  # path -> (mtime, size, snippet)
+
+
 def _read_attachment_content(attach_url: str, attach_type: str) -> str:
     """Try to read uploaded file content from the local filesystem.
-    Returns a string snippet to embed in the message, or empty string if unreadable."""
+    Returns a string snippet to embed in the message, or empty string if unreadable.
+
+    Results are cached by (path, mtime, size) — attachments are effectively
+    immutable, and OCR costs up to 30s per image per turn otherwise."""
     if not attach_url or not attach_url.startswith("/uploads/"):
         return ""
 
@@ -477,6 +488,22 @@ def _read_attachment_content(attach_url: str, attach_type: str) -> str:
             return ""
         if not resolved.exists() or not resolved.is_file():
             return ""
+
+        st = None
+        try:
+            st = resolved.stat()
+            cached = _ATTACH_TEXT_CACHE.get(str(resolved))
+            if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                return cached[2]
+        except OSError:
+            st = None
+
+        def _store(snippet: str) -> str:
+            if st is not None:
+                _ATTACH_TEXT_CACHE[str(resolved)] = (st.st_mtime, st.st_size, snippet)
+                if len(_ATTACH_TEXT_CACHE) > 256:  # bounded
+                    _ATTACH_TEXT_CACHE.pop(next(iter(_ATTACH_TEXT_CACHE)))
+            return snippet
 
         # Read first 8KB of content
         raw = resolved.read_bytes()[:8192]
@@ -508,17 +535,17 @@ def _read_attachment_content(attach_url: str, attach_type: str) -> str:
                         capture_output=True, text=True, timeout=30
                     ).stdout.strip()
                     if ocr_text and len(ocr_text) > 10:
-                        return f"\n\n--- Attached image (OCR extracted): {fname} ---\n{ocr_text}\n--- End of OCR text ---"
+                        return _store(f"\n\n--- Attached image (OCR extracted): {fname} ---\n{ocr_text}\n--- End of OCR text ---")
                 except Exception:
                     pass
             
-            return f"[{mime_hint} file, {size} bytes — content not readable as text]"
+            return _store(f"[{mime_hint} file, {size} bytes — content not readable as text]")
 
         # Truncate to reasonable length
         if len(text) > 6000:
             text = text[:6000] + "\n… [truncated]"
 
-        return f"\n\n--- Attached file: {fname} ---\n{text}\n--- End of attached file ---"
+        return _store(f"\n\n--- Attached file: {fname} ---\n{text}\n--- End of attached file ---")
 
     except Exception as e:
         logger.warning("Failed to read attachment %s: %s", attach_url, e)
@@ -566,21 +593,21 @@ def _build_openai_messages(session_id: str) -> list[dict]:
 
 
 class ChatRequest(BaseModel):
-    query: str
-    session_id: Optional[str] = None
+    query: str = Field(max_length=8_000)
+    session_id: Optional[str] = Field(default=None, max_length=64)
     stream: bool = True
-    attachment_url: Optional[str] = None
-    attachment_type: Optional[str] = None
+    attachment_url: Optional[str] = Field(default=None, max_length=512)
+    attachment_type: Optional[str] = Field(default=None, max_length=32)
 
 
 class TtsRequest(BaseModel):
-    text: str
-    voice: Optional[str] = None
+    text: str = Field(max_length=4_000)
+    voice: Optional[str] = Field(default=None, max_length=64)
 
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(max_length=72)  # bcrypt truncates at 72 bytes
 
 
 class LoginRequest(BaseModel):
@@ -594,8 +621,9 @@ class RefreshRequest(BaseModel):
 
 # ─── App ─────────────────────────────────────────────────────────────────
 
+VERSION = "2.2.1"  # single source of truth for the bridge version
 
-app = FastAPI(title="Hermes Mobile Bridge", version="2.0.0")
+app = FastAPI(title="Hermes Mobile Bridge", version=VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -944,7 +972,7 @@ DIAG_LOGS_MAX_FILES = 20
 
 
 @app.post("/api/diag/log")
-async def upload_diag_log(body: DiagLogRequest, uid: int = Depends(verify_bearer)):
+async def upload_diag_log(body: DiagLogRequest, user: dict = Depends(verify_bearer)):
     """Accept the app's on-device diag.log (last 24h) and store it under
     STORE_PATH/logs/ so the user/maintainer can pull it for analysis.
     Filename is sanitized (device + timestamp); old uploads are pruned
@@ -954,12 +982,15 @@ async def upload_diag_log(body: DiagLogRequest, uid: int = Depends(verify_bearer
         safe_device = re.sub(r"[^A-Za-z0-9_-]", "_", body.device)[:40] or "device"
         ts = time.strftime("%Y%m%d_%H%M%S")
         path = DIAG_LOGS_DIR / f"{safe_device}-{ts}.txt"
+        # Only the user id (sub) goes into the stored file — never the full
+        # JWT payload (email etc.).
+        user_id = str(user.get("sub", user.get("email", "?")))[:40]
         header = (
             f"# Hermes mobile diag log upload\n"
             f"# device: {body.device}\n"
             f"# version: {body.version}\n"
             f"# uploaded: {time.ctime()}\n"
-            f"# user: {uid}\n"
+            f"# user: {user_id}\n"
             f"# ---- last 24h activity ----\n"
         )
         path.write_text(header + body.log, encoding="utf-8", errors="replace")
@@ -1884,7 +1915,10 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
                 except (json.JSONDecodeError, IndexError):
                     pass
     except Exception as e:
-        error_msg = str(e)
+        # Friendly error — never leak raw exception text to the client
+        # (the stream path sanitizes; the sync path must too).
+        logger.warning("sync chat failed for session %s: %s", session_id, e)
+        error_msg = "Request failed. Check connection and try again."
 
     final_response = "".join(response_chunks)
 
@@ -1909,21 +1943,18 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
 async def upload_file(
     request: Request,
     file: UploadFile = File(...),
+    user: dict = Depends(verify_bearer),
 ):
     """Upload a file to the session's uploads directory."""
-    # Verify JWT auth — header only (query-param tokens leak into access logs)
-    payload = None
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        token = auth[7:].strip()
-        payload = decode_access_token(token, JWT_SECRET)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    # JWT auth via the shared dependency (header only — query-param tokens
+    # leak into access logs). Static-key users pass through here too,
+    # matching every other endpoint.
+    payload = user
 
     # Validate user still exists
     user_id = int(payload["sub"])
-    user = auth_db.get_user_by_email(payload["email"])
-    if not user or user.id != user_id:
+    user_row = auth_db.get_user_by_email(payload["email"])
+    if not user_row or user_row.id != user_id:
         raise HTTPException(status_code=401, detail="User not found")
 
     # Determine session_id from query param, or use user-specific default
@@ -2244,7 +2275,7 @@ async def setup_qr(request: Request, token: str = "", claim: str = ""):
         raise HTTPException(status_code=501, detail="qrcode[pil] not installed — run: pip install qrcode[pil]")
 
     # Tailscale IP (primary) → tunnel URL (fallback) → LAN IP (last resort)
-    ts_ip = _detect_host_ip()
+    ts_ip = await _detect_host_ip_async()
     if ts_ip and ts_ip.startswith("100."):
         setup_url = f"hermes://connect?host={ts_ip}&port={PORT}&key={HERMES_API_KEY}&setup={SETUP_TOKEN}"
     else:
@@ -2291,11 +2322,11 @@ async def setup_connect(request: Request, token: str = ""):
                 "key": HERMES_API_KEY,
                 "model": AI_MODEL,
                 "provider": AI_BASE_URL,
-                "version": "2.2.1",
+                "version": VERSION,
             }
 
     # 2. Caller used the Tailscale IP directly → keep them on Tailscale.
-    ts_ip = _detect_host_ip()
+    ts_ip = await _detect_host_ip_async()
     if ts_ip and ts_ip.startswith("100."):
         return {
             "host": ts_ip,
@@ -2304,7 +2335,7 @@ async def setup_connect(request: Request, token: str = ""):
             "key": HERMES_API_KEY,
             "model": AI_MODEL,
             "provider": AI_BASE_URL,
-            "version": "2.2.1",
+            "version": VERSION,
         }
 
     # 3. Fallback: tunnel → LAN IP (last resort)
@@ -2315,9 +2346,9 @@ async def setup_connect(request: Request, token: str = ""):
             "key": HERMES_API_KEY,
             "model": AI_MODEL,
             "provider": AI_BASE_URL,
-            "version": "2.2.1",
+            "version": VERSION,
         }
-    host_ip = _detect_host_ip()
+    host_ip = await _detect_host_ip_async()
     return {
         "host": host_ip,
         "port": PORT,
@@ -2325,8 +2356,26 @@ async def setup_connect(request: Request, token: str = ""):
         "key": HERMES_API_KEY,
         "model": AI_MODEL,
         "provider": AI_BASE_URL,
-        "version": "2.2.1",
+        "version": VERSION,
     }
+
+
+_host_ip_cache: tuple[float, str] | None = None
+_HOST_IP_CACHE_TTL = 600  # seconds — the IP rarely changes
+
+
+async def _detect_host_ip_async() -> str:
+    """Cached, event-loop-safe wrapper for _detect_host_ip.
+
+    The sync version blocks on subprocess probes (up to ~15s); running it
+    on the event loop froze setup endpoints. to_thread + 10-min cache."""
+    global _host_ip_cache
+    now = time.time()
+    if _host_ip_cache and now - _host_ip_cache[0] < _HOST_IP_CACHE_TTL:
+        return _host_ip_cache[1]
+    ip = await asyncio.to_thread(_detect_host_ip)
+    _host_ip_cache = (now, ip)
+    return ip
 
 
 def _detect_tunnel_url() -> str:
@@ -2343,7 +2392,10 @@ def _detect_tunnel_url() -> str:
 
 
 def _detect_host_ip() -> str:
-    """Detect the best IP for the app to connect to."""
+    """Detect the best IP for the app to connect to.
+
+    WARNING: runs up to 3 sequential subprocess probes (~5s each) — call
+    via _detect_host_ip_async() from async handlers, never directly."""
     # 0. Env override (set by plugin's Tailscale auto-setup)
     ts_ip = os.environ.get("HERMES_TAILSCALE_IP", "")
     if ts_ip and ts_ip.startswith("100."):
@@ -2443,7 +2495,7 @@ async def start_discovery():
         await client.heartbeat(
             tunnel_url=tunnel_url,
             platform=sys.platform,
-            version="2.0.0",
+            version=VERSION,
         )
         print(f"   Tunnel URL: {tunnel_url}")
     else:
