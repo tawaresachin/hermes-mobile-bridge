@@ -36,7 +36,7 @@ from fastapi import FastAPI, File, HTTPException, Request, Depends, UploadFile, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse, JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 # Local auth modules
 from auth_db import get_auth_db
@@ -928,8 +928,71 @@ async def diag(request: Request):
             "auth_register": "POST /auth/register",
             "auth_login": "POST /auth/login",
             "auth_refresh": "POST /auth/refresh",
+            "diag_log": "POST /api/diag/log",
         },
     }
+
+
+class DiagLogRequest(BaseModel):
+    device: str = Field(default="", max_length=64)
+    version: str = Field(default="", max_length=32)
+    log: str = Field(default="", max_length=300_000)
+
+
+DIAG_LOGS_DIR = STORE_PATH / "logs"
+DIAG_LOGS_MAX_FILES = 20
+
+
+@app.post("/api/diag/log")
+async def upload_diag_log(body: DiagLogRequest, uid: int = Depends(verify_bearer)):
+    """Accept the app's on-device diag.log (last 24h) and store it under
+    STORE_PATH/logs/ so the user/maintainer can pull it for analysis.
+    Filename is sanitized (device + timestamp); old uploads are pruned
+    (keep the newest DIAG_LOGS_MAX_FILES)."""
+    try:
+        DIAG_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        safe_device = re.sub(r"[^A-Za-z0-9_-]", "_", body.device)[:40] or "device"
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = DIAG_LOGS_DIR / f"{safe_device}-{ts}.txt"
+        header = (
+            f"# Hermes mobile diag log upload\n"
+            f"# device: {body.device}\n"
+            f"# version: {body.version}\n"
+            f"# uploaded: {time.ctime()}\n"
+            f"# user: {uid}\n"
+            f"# ---- last 24h activity ----\n"
+        )
+        path.write_text(header + body.log, encoding="utf-8", errors="replace")
+        # Prune: keep the newest N uploads
+        files = sorted(DIAG_LOGS_DIR.glob("*.txt"), key=lambda f: f.stat().st_mtime, reverse=True)
+        for stale in files[DIAG_LOGS_MAX_FILES:]:
+            try:
+                stale.unlink()
+            except Exception:
+                pass
+        logger.info("diag log saved: %s (%d bytes, %d files kept)", path.name, path.stat().st_size, len(files[:DIAG_LOGS_MAX_FILES]))
+        return {"status": "ok", "file": path.name}
+    except Exception as e:
+        logger.warning("diag log upload failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to store diag log")
+
+
+@app.get("/api/diag/logs")
+async def list_diag_logs(uid: int = Depends(verify_bearer)):
+    """List stored diag-log uploads (maintainer convenience)."""
+    try:
+        if not DIAG_LOGS_DIR.exists():
+            return {"logs": []}
+        files = sorted(DIAG_LOGS_DIR.glob("*.txt"), key=lambda f: f.stat().st_mtime, reverse=True)
+        return {
+            "logs": [
+                {"file": f.name, "size": f.stat().st_size, "modified": f.stat().st_mtime}
+                for f in files
+            ]
+        }
+    except Exception as e:
+        logger.warning("diag log list failed: %s", e)
+        return {"logs": []}
 
 
 @app.get("/api/sessions")
