@@ -2,15 +2,37 @@
 """Web tools — search and extract content from the web."""
 from __future__ import annotations
 
+import html as html_mod
 import json
 import re
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 
 from tools import BaseTool
 
 _http = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+
+
+def _decode_ddg_url(href: str) -> str:
+    """Decode a DuckDuckGo /l/?uddg= redirect link into the real target URL.
+
+    DDG HTML results link to //duckduckgo.com/l/?uddg=<urlencoded-url>&rut=...
+    Fetching that /l/ endpoint returns HTTP 400, so callers must decode the
+    uddg param. Falls back to the raw href when uddg is absent or malformed.
+    """
+    href = html_mod.unescape(href.strip())
+    if "uddg=" not in href:
+        return href
+    try:
+        qs = parse_qs(urlparse(href).query)
+        if qs.get("uddg"):
+            decoded = unquote(qs["uddg"][0])
+            if decoded.startswith(("http://", "https://")):
+                return decoded
+    except Exception:
+        pass
+    return href
 
 
 class WebSearch(BaseTool):
@@ -51,7 +73,7 @@ class WebSearch(BaseTool):
                 r'<a rel="nofollow" class="result__a" href="(.*?)">(.*?)</a>',
                 html, re.DOTALL
             ):
-                url = match.group(1)
+                url = _decode_ddg_url(match.group(1))
                 title = re.sub(r'<.*?>', '', match.group(2)).strip()
                 # Find snippet after this anchor
                 snippet_match = re.search(

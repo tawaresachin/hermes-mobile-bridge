@@ -74,7 +74,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "\n\n"
     "You run on the Hermes Mobile Bridge server and have access to real system tools: "
     "terminal (shell commands), file_ops (read/write/patch/search files), "
-    "and web (search/extract URLs). "
+    "and web (search/extract URLs, multi-source research). "
     "When a task requires external action, use the appropriate tool."
     "\n\n"
     "For HEAVY or complex work — big coding projects, multi-step research, "
