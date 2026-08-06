@@ -237,6 +237,15 @@ def _start_server(port: int, host: str, omniroute: bool) -> None:
     server_python = _pick_server_python()
     print(f"   Server interpreter: {server_python}")
 
+    # Android/Termux: hold a wake lock so the OS (battery optimization,
+    # deep sleep) can't kill the bridge mid-conversation — a dead server
+    # leaves the phone app stuck on 'Thinking…' until it restarts.
+    if os.name == "posix" and os.environ.get("PREFIX", "").endswith("/files/usr"):
+        try:
+            subprocess.run(["termux-wake-lock"], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
     subprocess.run(
         [server_python, "-B", "server.py"],
         cwd=str(bridge_dir),
