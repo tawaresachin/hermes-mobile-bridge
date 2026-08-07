@@ -384,7 +384,7 @@ class AgentLoop:
                 "Duration:",
                 "Messages:",
             )
-            box_borders = ("╭", "├", "╰", "─", "╮", "╯", "╼", "╽", "│")
+            box_borders = ("╭", "├", "╰", "─", "╮", "╯", "╼", "╽", "│", "┌", "┐", "└", "┘", "┼", "┬", "┴")
             assert proc.stdout is not None
             async for raw in proc.stdout:
                 line = raw.decode(errors="replace").rstrip("\n")
