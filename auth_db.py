@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,20 @@ class RefreshToken:
 
 
 # ─── Core DB ───
+
+# One shared sqlite3 connection is used from the event loop AND worker
+# threads (check_same_thread=False). Interleaved transactions on a single
+# connection raise "cannot commit - no transaction is active" — every DB
+# method must run under this lock.
+_db_lock = threading.RLock()
+
+
+def _synchronized(fn):
+    """Serialize access to the shared sqlite connection."""
+    def wrapper(*args, **kwargs):
+        with _db_lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 class AuthDB:
@@ -92,6 +107,7 @@ class AuthDB:
 
     # ─── User operations ───
 
+    @_synchronized
     def create_user(self, email: str, password: str) -> User:
         """Register a new user. Raises ValueError if email exists."""
         conn = self._get_conn()
@@ -120,6 +136,7 @@ class AuthDB:
         except sqlite3.IntegrityError:
             raise ValueError("Email already registered")
 
+    @_synchronized
     def get_user_by_email(self, email: str) -> Optional[User]:
         conn = self._get_conn()
         row = conn.execute(
@@ -143,6 +160,7 @@ class AuthDB:
         """SHA-256 of the raw refresh token (we never store plaintext)."""
         return hashlib.sha256(token.encode()).hexdigest()
 
+    @_synchronized
     def create_refresh_token(self, user_id: int) -> tuple[str, int]:
         """Generate a new refresh token. Returns (raw_token, expires_at)."""
         conn = self._get_conn()
@@ -158,6 +176,7 @@ class AuthDB:
         conn.commit()
         return raw_token, expires_at
 
+    @_synchronized
     def verify_refresh_token(self, raw_token: str) -> Optional[int]:
         """Verify a refresh token. Returns user_id if valid, None otherwise.
         Implements rotation atomically: DELETE ... RETURNING in ONE statement
@@ -186,6 +205,7 @@ class AuthDB:
             return None
         return row[0]
 
+    @_synchronized
     def revoke_all_refresh_tokens(self, user_id: int) -> None:
         """Log out user from all devices."""
         conn = self._get_conn()

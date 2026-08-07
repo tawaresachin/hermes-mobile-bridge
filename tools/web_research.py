@@ -479,12 +479,18 @@ class WebResearch(BaseTool):
 
     async def _extract_article(self, url: str) -> ExtractResult:
         # SSRF guard: only public http(s) targets — never localhost, the
-        # OmniRoute gateway, Tailscale/CGNAT, or RFC1918 ranges.
-        from tools.web import is_safe_url
+        # OmniRoute gateway, Tailscale/CGNAT, or RFC1918 ranges. Redirects
+        # are walked and re-checked hop-by-hop (a Location header pointing
+        # at a private host is refused).
+        from tools.web import fetch_safe, is_safe_url
         if not is_safe_url(url):
             return ExtractResult(url=url, title="", text="", error="blocked non-public URL")
         try:
-            async with self._client.stream("GET", url, headers=_UA_HEADERS) as resp:
+            resp, err = await fetch_safe(url, headers=_UA_HEADERS, client=self._client)
+            if err:
+                return ExtractResult(url=url, error=err.removeprefix("⚠ "))
+            assert resp is not None  # err == None implies a response
+            try:
                 if resp.status_code != 200:
                     return ExtractResult(url=url, error=f"HTTP {resp.status_code}")
                 chunks = []
@@ -496,6 +502,8 @@ class WebResearch(BaseTool):
                             url=url, error=f"page too large (>{PER_URL_BYTES_CAP} bytes)"
                         )
                     chunks.append(chunk)
+            finally:
+                await resp.aclose()
             html_text = b"".join(chunks).decode("utf-8", errors="replace")
             text = _strip_boilerplate(_html_to_text(html_text))
             if not text:

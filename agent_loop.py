@@ -145,6 +145,12 @@ def sse_done() -> str:
     return "data: [DONE]\n\n"
 
 
+def sse_error(content: str) -> str:
+    """Distinct error event — MUST NOT be collected as reply text by the
+    SSE consumer, so failed turns never pollute chat history."""
+    return f"data: {json.dumps({'type': 'error', 'content': content})}\n\n"
+
+
 # ─── Agent Loop ─────────────────────────────────────────────────────────
 
 
@@ -272,7 +278,7 @@ class AgentLoop:
             async for event in self._call_ai(all_messages, system_prompt=enhanced_prompt):
                 event_type = event.get("type", "")
                 if event_type == "error":
-                    yield sse_text(event.get("content", "AI error"))
+                    yield sse_error(event.get("content", "AI error"))
                     yield sse_done()
                     return
                 elif event_type == "text":
@@ -332,7 +338,6 @@ class AgentLoop:
             all_messages.append(msg_entry)
 
             # --- Execute each tool ---
-            result_texts = []
             for tc in tool_calls:
                 yield sse_tool_call(tc)  # status=running
                 any_tool_events = True
@@ -340,7 +345,6 @@ class AgentLoop:
                 result = await self.tools.execute(tc)
 
                 yield sse_tool_result(result)
-                result_texts.append(f"Tool '{tc.name}' returned: {result.output or result.error}")
 
                 # Add tool result to conversation history
                 all_messages.append({
@@ -400,14 +404,21 @@ class AgentLoop:
             )
             box_borders = ("╭", "├", "╰", "─", "╮", "╯", "╼", "╽", "│", "┌", "┐", "└", "┘", "┼", "┬", "┴")
             assert proc.stdout is not None
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip("\n")
-                stripped = line.strip()
-                if not stripped or stripped.startswith(box_borders):
-                    continue
-                if stripped.startswith(noise_prefixes):
-                    continue
-                yield sse_text(line)
+            try:
+                # Wall-clock cap: a hung `hermes chat` must not hold the SSE
+                # connection open forever (10 min for the swarm, plenty).
+                async with asyncio.timeout(600):
+                    async for raw in proc.stdout:
+                        line = raw.decode(errors="replace").rstrip("\n")
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith(box_borders):
+                            continue
+                        if stripped.startswith(noise_prefixes):
+                            continue
+                        yield sse_text(line)
+            except TimeoutError:
+                proc.kill()
+                yield sse_text("\n[⚠ swarm run timed out after 10 minutes]")
         except asyncio.CancelledError:
             proc.kill()
             raise
@@ -436,10 +447,15 @@ class AgentLoop:
         )
         try:
             assert proc.stdout is not None
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip("\n")
-                if line.strip() and not line.strip().startswith("Session:"):
-                    yield sse_text(line)
+            try:
+                async with asyncio.timeout(300):  # 5-min cap for the plain fallback
+                    async for raw in proc.stdout:
+                        line = raw.decode(errors="replace").rstrip("\n")
+                        if line.strip() and not line.strip().startswith("Session:"):
+                            yield sse_text(line)
+            except TimeoutError:
+                proc.kill()
+                yield sse_text("\n[⚠ hermes run timed out after 5 minutes]")
         except asyncio.CancelledError:
             proc.kill()
             raise

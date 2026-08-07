@@ -361,6 +361,12 @@ def _messages_path(session_id: str) -> Path:
     return STORE_PATH / f"messages_{safe}.json"
 
 
+# Serializes load-modify-save on sessions.json / messages_*.json. Without
+# it, two concurrent turns on the same session both read, both write — one
+# update is silently lost and messageCount regresses.
+_FS_LOCK = threading.Lock()
+
+
 def load_sessions() -> list[dict]:
     p = _sessions_path()
     if p.exists():
@@ -395,51 +401,54 @@ def save_messages(session_id: str, msgs: list[dict]) -> None:
 
 def _save_user_message(session_id: str, query: str, attachment_url: str = "", attachment_type: str = "") -> None:
     """Append the user's query to the message history and persist."""
-    msgs = load_messages(session_id)
-    entry = {"role": "user", "content": query, "timestamp": time.time()}
-    if attachment_url:
-        entry["attachment_url"] = attachment_url
-        entry["attachment_type"] = attachment_type
-    msgs.append(entry)
-    save_messages(session_id, msgs)
+    with _FS_LOCK:
+        msgs = load_messages(session_id)
+        entry = {"role": "user", "content": query, "timestamp": time.time()}
+        if attachment_url:
+            entry["attachment_url"] = attachment_url
+            entry["attachment_type"] = attachment_type
+        msgs.append(entry)
+        save_messages(session_id, msgs)
 
 
 def _save_assistant_message(session_id: str, content: str, reasoning_content: str = "") -> None:
     """Append the assistant response to the message history and persist.
     reasoning_content (DeepSeek thinking mode) is stored so it can be
     echoed back to the API on the next turn — DeepSeek requires it."""
-    msgs = load_messages(session_id)
-    entry = {"role": "assistant", "content": content, "timestamp": time.time()}
-    if reasoning_content:
-        entry["reasoning_content"] = reasoning_content
-    msgs.append(entry)
-    save_messages(session_id, msgs)
+    with _FS_LOCK:
+        msgs = load_messages(session_id)
+        entry = {"role": "assistant", "content": content, "timestamp": time.time()}
+        if reasoning_content:
+            entry["reasoning_content"] = reasoning_content
+        msgs.append(entry)
+        save_messages(session_id, msgs)
 
 
 def _upsert_session(session_id: str, query: str, owner_id: int | None = None) -> None:
     """Create or update a session entry from a user query."""
-    sessions = load_sessions()
-    existing = next((s for s in sessions if s["id"] == session_id), None)
-    if existing:
-        existing["messageCount"] = (existing.get("messageCount", 0) or 0) + 1
-        existing["updatedAt"] = int(time.time() * 1000)
-        # Legacy sessions (pre-ownership) get claimed by the first user who
-        # touches them — auto-migrates old data without exposing it to others.
-        if owner_id is not None and existing.get("owner_id") is None:
-            existing["owner_id"] = owner_id
-    else:
-        sessions.insert(
-            0,
-            {
-                "id": session_id,
-                "title": query[:60] + ("…" if len(query) > 60 else ""),
-                "messageCount": 1,
-                "createdAt": int(time.time() * 1000),
-                "updatedAt": int(time.time() * 1000),
-                "owner_id": owner_id,
-            },
-        )
-    save_sessions(sessions)
+    with _FS_LOCK:
+        sessions = load_sessions()
+        existing = next((s for s in sessions if s["id"] == session_id), None)
+        if existing:
+            existing["messageCount"] = (existing.get("messageCount", 0) or 0) + 1
+            existing["updatedAt"] = int(time.time() * 1000)
+            # Legacy sessions (pre-ownership) get claimed by the first user who
+            # touches them — auto-migrates old data without exposing it to others.
+            if owner_id is not None and existing.get("owner_id") is None:
+                existing["owner_id"] = owner_id
+        else:
+            sessions.insert(
+                0,
+                {
+                    "id": session_id,
+                    "title": query[:60] + ("…" if len(query) > 60 else ""),
+                    "messageCount": 1,
+                    "createdAt": int(time.time() * 1000),
+                    "updatedAt": int(time.time() * 1000),
+                    "owner_id": owner_id,
+                },
+            )
+        save_sessions(sessions)
 
 
 def _session_owner_id(session_id: str) -> int | None:
@@ -734,11 +743,20 @@ def _uploads_allowed(request: Request, user: dict) -> bool:
 
     Runs inside auth_middleware so the static /uploads mount stays behind
     per-session ownership — an authenticated user cannot fetch another
-    user's attachments by guessing the URL."""
+    user's attachments by guessing the URL.
+
+    TRAVERSAL GUARD: Starlette's StaticFiles collapses ``..`` segments when
+    resolving the file, so checking the RAW path segment alone is a bypass
+    (``/uploads/mine/../victim/file``). We normalize the path FIRST and check
+    the real session segment, and reject any path containing ``..`` outright.
+    """
+    import posixpath
     path = request.url.path
     if not path.startswith("/uploads/"):
         return True
-    parts = path.strip("/").split("/")
+    if ".." in path:
+        return False
+    parts = posixpath.normpath(path.strip("/")).split("/")
     if len(parts) < 2:
         return False
     try:
@@ -899,15 +917,17 @@ async def access_log_middleware(request: Request, call_next):
     """Structured access log with duration — one line per request.
     Registered after auth_middleware, so it wraps it (401s are logged too)."""
     start = time.perf_counter()
+    request_id = uuid.uuid4().hex[:8]
+    request.state.request_id = request_id
     try:
         response = await call_next(request)
     except Exception:
-        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        logger.exception("req=%s unhandled error on %s %s", request_id, request.method, request.url.path)
         raise
     duration_ms = (time.perf_counter() - start) * 1000
     logger.info(
-        "req %s %s -> %d (%.1fms)",
-        request.method, request.url.path, response.status_code, duration_ms,
+        "req=%s %s %s -> %d (%.1fms)",
+        request_id, request.method, request.url.path, response.status_code, duration_ms,
     )
     return response
 
@@ -1815,10 +1835,9 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     if not query and has_attachment:
         query = "[User attached a file without text]"
 
-    _save_user_message(session_id, query, body.attachment_url or "", body.attachment_type or "")
-    _upsert_session(session_id, query, uid)
-
-    # ─── Pre-check for special commands (model switch, etc.) ───
+    # ─── Pre-check for special commands (model switch, etc.) — BEFORE any
+    # persistence: commands are control messages, not chat history, so they
+    # must never be saved as user bubbles or bump messageCount.
     handled, cmd_response = _handle_special_command(query, session_id)
     if handled and cmd_response:
         async def _cmd_generator():
@@ -1829,6 +1848,9 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    _save_user_message(session_id, query, body.attachment_url or "", body.attachment_type or "")
+    _upsert_session(session_id, query, uid)
 
     # Load conversation history — off the event loop: attachment reads / OCR
     # (subprocess, up to 30s) must never block other requests.
@@ -1921,13 +1943,21 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     if not _can_use_session(session_id, uid):
         return JSONResponse(status_code=403, content={"detail": "Not your session"})
 
-    _save_user_message(session_id, body.query)
-    _upsert_session(session_id, body.query, uid)
+    has_attachment = bool(body.attachment_url and body.attachment_url.strip())
+    if (not body.query or not body.query.strip()) and not has_attachment:
+        return JSONResponse(status_code=400, content={"detail": "Query cannot be empty"})
 
-    # ─── Pre-check for special commands (model switch, etc.) ───
-    handled, cmd_response = _handle_special_command(body.query, session_id)
+    query = body.query.strip() if body.query else ""
+    if not query and has_attachment:
+        query = "[User attached a file without text]"
+
+    # ─── Special commands first — never persisted (control, not chat) ───
+    handled, cmd_response = _handle_special_command(query, session_id)
     if handled and cmd_response:
         return {"response": cmd_response, "session_id": session_id}
+
+    _save_user_message(session_id, query, body.attachment_url or "", body.attachment_type or "")
+    _upsert_session(session_id, query, uid)
 
     # Use session-scoped model override if available
     effective_model = _resolve_model(session_id)
@@ -1954,7 +1984,9 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     error_msg = None
 
     try:
-        async for event in loop.run(openai_messages, body.query, session_id=session_id,
+        async for event in loop.run(openai_messages, query, session_id=session_id,
+                                    attachment_url=body.attachment_url or "",
+                                    attachment_type=body.attachment_type or "",
                                     multi_agent=body.multi_agent,
                                     model_override=_resolve_model(session_id)):
             # Try to parse every SSE data event (cover both text and error types)
@@ -2007,11 +2039,13 @@ async def upload_file(
     # matching every other endpoint.
     payload = user
 
-    # Validate user still exists
+    # Validate user still exists (skip for legacy static-key payloads —
+    # they have no DB row by design; every other endpoint lets them pass).
     user_id = int(payload["sub"])
-    user_row = auth_db.get_user_by_email(payload["email"])
-    if not user_row or user_row.id != user_id:
-        raise HTTPException(status_code=401, detail="User not found")
+    if payload.get("type") != "legacy":
+        user_row = auth_db.get_user_by_email(payload["email"])
+        if not user_row or user_row.id != user_id:
+            raise HTTPException(status_code=401, detail="User not found")
 
     # Determine session_id from query param, or use user-specific default
     session_id = request.query_params.get("session_id", payload.get("sub", "default"))
@@ -2562,7 +2596,17 @@ async def start_discovery():
         while True:
             await asyncio.sleep(180)
             try:
-                url = os.getenv("HERMES_TUNNEL_URL", tunnel_url or "")
+                # Re-read the tunnel URL on EVERY beat — the supervisor
+                # rewrites .current_tunnel_url when cloudflared rotates the
+                # URL; the startup snapshot would go stale.
+                current = tunnel_url or ""
+                try:
+                    st = STORE_PATH / ".current_tunnel_url"
+                    if st.exists():
+                        current = st.read_text().strip()
+                except Exception:
+                    pass
+                url = os.getenv("HERMES_TUNNEL_URL", current or "")
                 if url:
                     await client.heartbeat(url, platform=sys.platform)
             except Exception:

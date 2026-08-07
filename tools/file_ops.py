@@ -2,6 +2,7 @@
 """File system tools — read, write, search, and patch files."""
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
@@ -13,11 +14,21 @@ WORK_DIR = Path(os.getenv("AGENT_WORK_DIR", os.path.expanduser("~")))
 
 
 def _safe_path(path: str) -> Path:
-    """Resolve a path relative to the working directory, preventing escapes."""
-    p = Path(path)
-    if p.is_absolute():
-        return p
-    return (WORK_DIR / p).resolve()
+    """Resolve a path under the working directory, preventing escapes.
+
+    The docstring promise must match the code: ABSOLUTE paths are contained
+    too. Paths that resolve outside WORK_DIR are refused (they'd otherwise
+    expose .env / auth.db / /etc secrets to the agent — the terminal tool
+    is already full RCE by design, but the file tools shouldn't widen it).
+    """
+    work = WORK_DIR.resolve()
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = work / resolved
+    resolved = resolved.resolve()
+    if not resolved.is_relative_to(work):
+        raise ValueError(f"Path outside work dir: {path}")
+    return resolved
 
 
 class ReadFile(BaseTool):
@@ -53,19 +64,33 @@ class ReadFile(BaseTool):
 
         limit = min(limit, 2000)
         try:
-            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
-            total = len(lines)
+            # Memory-safe: stream small files fully; for large files count
+            # lines in a streaming pass, then read only the requested window.
+            import itertools
+            size = fpath.stat().st_size
+            if size <= 10 * 1024 * 1024:  # ≤10 MB fast path
+                lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+                total = len(lines)
+            else:
+                with fpath.open(encoding="utf-8", errors="replace") as f:
+                    total = sum(1 for _ in f)
+                with fpath.open(encoding="utf-8", errors="replace") as f:
+                    lines = list(itertools.islice(f, offset - 1, offset - 1 + limit))
             start = max(0, offset - 1)
             end = min(total, start + limit)
-            selected = lines[start:end]
-
+            if size > 10 * 1024 * 1024:
+                selected = lines  # already windowed
+                start_off = offset - 1
+            else:
+                selected = lines[start:end]
+                start_off = start
             output = "\n".join(
-                f"{i + start + 1}|{line}" for i, line in enumerate(selected)
+                f"{i + start_off + 1}|{line}" for i, line in enumerate(selected)
             )
-            if start > 0 or end < total:
-                output = f"{fpath} (showing lines {start + 1}-{end} of {total})\n{output}"
-                if end < total:
-                    output += f"\n... (use offset={end + 1} to continue)"
+            if start_off > 0 or (start_off + len(selected)) < total:
+                output = f"{fpath} (showing lines {start_off + 1}-{start_off + len(selected)} of {total})\n{output}"
+                if start_off + len(selected) < total:
+                    output += f"\n... (use offset={start_off + len(selected) + 1} to continue)"
             return output
         except Exception as e:
             return f"⚠ Error reading file: {e}"
@@ -140,12 +165,17 @@ class SearchFiles(BaseTool):
         search_path = _safe_path(path)
         limit = min(limit, 50)
 
+        async def _run_subprocess(cmd: list, timeout: int = 30) -> subprocess.CompletedProcess:
+            # Never block the event loop: find/rg/grep can take up to 30s.
+            return await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=timeout
+            )
+
         try:
             if target == "files":
                 # Use glob via find
-                result = subprocess.run(
-                    ["find", str(search_path), "-name", pattern, "-type", "f"],
-                    capture_output=True, text=True, timeout=30,
+                result = await _run_subprocess(
+                    ["find", str(search_path), "-name", pattern, "-type", "f"]
                 )
                 lines = [l for l in result.stdout.splitlines() if l.strip()][:limit]
                 if not lines:
@@ -154,7 +184,8 @@ class SearchFiles(BaseTool):
             else:
                 # Use ripgrep if available, else grep -r
                 cmd = []
-                if subprocess.run(["which", "rg"], capture_output=True).returncode == 0:
+                which = await _run_subprocess(["which", "rg"], timeout=10)
+                if which.returncode == 0:
                     cmd = ["rg", "-n", "--no-heading"]
                     if file_glob:
                         cmd.extend(["-g", file_glob])
@@ -168,9 +199,7 @@ class SearchFiles(BaseTool):
                     if file_glob:
                         cmd.append("--include=" + file_glob)
                     cmd.extend([pattern, str(search_path)])
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=30,
-                )
+                result = await _run_subprocess(cmd)
                 lines = [l for l in result.stdout.splitlines() if l.strip()][:limit]
                 if not lines:
                     return f"No matches for '{pattern}' in {search_path}"

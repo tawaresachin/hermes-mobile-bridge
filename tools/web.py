@@ -11,7 +11,35 @@ import httpx
 
 from tools import BaseTool
 
-_http = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+_http = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+async def fetch_safe(url: str, headers: dict | None = None, max_hops: int = 5, client: httpx.AsyncClient | None = None):
+    """Fetch a URL with SSRF re-check on EVERY redirect hop.
+
+    ``follow_redirects=True`` only validates the INITIAL URL — a Location
+    header can then point at 127.0.0.1 / 169.254.169.254 unchecked.
+    We walk the redirect chain ourselves and validate each hop.
+    Returns (httpx.Response, None) or (None, error_string).
+    """
+    http = client or _http
+    current = url
+    for _ in range(max_hops + 1):
+        if not is_safe_url(current):
+            return None, "⚠ Refusing to fetch non-public URL (blocked private/loopback host)"
+        req = http.build_request("GET", current, headers=headers)
+        resp = await http.send(req, stream=True)
+        if resp.status_code in _REDIRECT_STATUSES:
+            location = resp.headers.get("location")
+            await resp.aclose()
+            if not location:
+                return None, f"⚠ Failed to fetch: HTTP {resp.status_code}"
+            current = str(httpx.URL(current).join(location))
+            continue
+        return resp, None
+    return None, "⚠ Too many redirects"
 
 
 def is_safe_url(url: str) -> bool:
@@ -145,10 +173,17 @@ class WebExtract(BaseTool):
         if not is_safe_url(url):
             return "⚠ Refusing to fetch non-public URL (blocked private/loopback host)"
         try:
-            async with _http.stream("GET", url, headers={
-                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-            }) as resp:
+            resp, err = await fetch_safe(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            if err:
+                return err
+            assert resp is not None  # err == None implies a response
+            try:
                 if resp.status_code != 200:
                     return f"⚠ Failed to fetch: HTTP {resp.status_code}"
                 # Byte-cap the download (1.5 MB) — a huge page must not
@@ -162,6 +197,8 @@ class WebExtract(BaseTool):
                         break
                     chunks.append(chunk)
                 html = b"".join(chunks).decode("utf-8", errors="replace")
+            finally:
+                await resp.aclose()
 
             # Strip HTML tags for basic readability
             text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
