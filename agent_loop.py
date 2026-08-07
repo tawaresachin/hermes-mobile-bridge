@@ -203,10 +203,15 @@ class AgentLoop:
         session_id: str = "",
         attachment_url: str = "",
         attachment_type: str = "",
+        multi_agent: bool = False,
     ) -> AsyncGenerator[str, None]:
         """
         Run the agent loop for a new user query.
         Yields SSE-formatted events (text, tool_call, tool_result, [DONE]).
+
+        When multi_agent=True, the query is handed to the full Hermes agent
+        with the ruflo swarm skill preloaded (8 parallel specialists) — a
+        minutes-long run streamed back chunk by chunk.
         """
         # Check for slash commands first
         if not query or not query.strip():
@@ -219,6 +224,13 @@ class AgentLoop:
         handled, cmd_response = await asyncio.to_thread(handle_command, query, session_id)
         if handled and cmd_response:
             yield sse_text(cmd_response)
+            yield sse_done()
+            return
+
+        # ─── Multi-agent mode: ruflo swarm on the full Hermes agent ───
+        if multi_agent:
+            async for event in self._run_ruflo(query):
+                yield event
             yield sse_done()
             return
 
@@ -328,6 +340,83 @@ class AgentLoop:
 
         # AI finished without (more) tool calls — we're done
         yield sse_done()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Multi-agent mode: ruflo swarm (full Hermes agent, 8 specialists)
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _run_ruflo(self, query: str) -> AsyncGenerator[str, None]:
+        """Stream a query through `hermes chat -s ruflo` (the multi-agent
+        swarm harness). Runs as an async subprocess, yielding each line as
+        SSE text — minutes-long runs arrive progressively, not in a lump.
+
+        Falls back to plain `hermes chat -q` if the ruflo skill is missing,
+        so the toggle never hard-fails."""
+        hermes_bin = os.getenv("HERMES_BIN", "hermes")
+        cmd = [hermes_bin, "chat", "-q", query.strip(), "-s", "ruflo"]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ},
+        )
+        try:
+            # Stream stdout line-by-line; trim the trailing
+            # "Session: … Duration: …" footer hermes appends.
+            saw_footer = False
+            assert proc.stdout is not None
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip("\n")
+                if not line.strip():
+                    continue
+                if line.strip().startswith("Session:"):
+                    saw_footer = True
+                    continue
+                if saw_footer and not line.strip():
+                    continue
+                if line.strip():
+                    saw_footer = False
+                yield sse_text(line)
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
+        finally:
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            # If the run failed (skill missing / CLI error), surface stderr
+            # as a plain single-query fallback so the toggle still works.
+            if proc.returncode not in (0, None):
+                stderr = (await proc.stderr.read()).decode(errors="replace") if proc.stderr else ""
+                if "no such skill" in stderr.lower() or "unknown skill" in stderr.lower():
+                    yield sse_text("\n[ruflo skill missing — retrying with plain agent]")
+                    async for ev in self._run_plain_hermes(query):
+                        yield ev
+
+    async def _run_plain_hermes(self, query: str) -> AsyncGenerator[str, None]:
+        """Single-query fallback: `hermes chat -q` without skills."""
+        hermes_bin = os.getenv("HERMES_BIN", "hermes")
+        proc = await asyncio.create_subprocess_exec(
+            hermes_bin, "chat", "-q", query.strip(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ},
+        )
+        try:
+            assert proc.stdout is not None
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip("\n")
+                if line.strip() and not line.strip().startswith("Session:"):
+                    yield sse_text(line)
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
+        finally:
+            try:
+                await proc.wait()
+            except Exception:
+                pass
 
     # ─────────────────────────────────────────────────────────────────────
     # Context compaction: rolling summary for lengthy conversations

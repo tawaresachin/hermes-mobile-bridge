@@ -598,6 +598,7 @@ class ChatRequest(BaseModel):
     stream: bool = True
     attachment_url: Optional[str] = Field(default=None, max_length=512)
     attachment_type: Optional[str] = Field(default=None, max_length=32)
+    multi_agent: bool = False
 
 
 class TtsRequest(BaseModel):
@@ -1808,7 +1809,8 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
         try:
             async for event in loop.run(openai_messages, query, session_id=session_id,
                                          attachment_url=body.attachment_url or "",
-                                         attachment_type=body.attachment_type or ""):
+                                         attachment_type=body.attachment_type or "",
+                                         multi_agent=body.multi_agent):
                 yield event
                 # Collect text + reasoning for saving
                 if event.startswith('data: {'):
@@ -1900,7 +1902,8 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     error_msg = None
 
     try:
-        async for event in loop.run(openai_messages, body.query, session_id=session_id):
+        async for event in loop.run(openai_messages, body.query, session_id=session_id,
+                                    multi_agent=body.multi_agent):
             # Try to parse every SSE data event (cover both text and error types)
             if event.startswith('data: {'):
                 try:
