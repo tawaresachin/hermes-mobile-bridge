@@ -369,6 +369,7 @@ class AgentLoop:
                 "Query: ",
                 "Initializing agent",
                 "Resume this session with",
+                "hermes --resume",
                 "Session:",
                 "Duration:",
                 "Messages:",
