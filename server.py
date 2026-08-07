@@ -1810,7 +1810,8 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             async for event in loop.run(openai_messages, query, session_id=session_id,
                                          attachment_url=body.attachment_url or "",
                                          attachment_type=body.attachment_type or "",
-                                         multi_agent=body.multi_agent):
+                                         multi_agent=body.multi_agent,
+                                         model_override=_resolve_model(session_id)):
                 yield event
                 # Collect text + reasoning for saving
                 if event.startswith('data: {'):
@@ -1903,7 +1904,8 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
 
     try:
         async for event in loop.run(openai_messages, body.query, session_id=session_id,
-                                    multi_agent=body.multi_agent):
+                                    multi_agent=body.multi_agent,
+                                    model_override=_resolve_model(session_id)):
             # Try to parse every SSE data event (cover both text and error types)
             if event.startswith('data: {'):
                 try:

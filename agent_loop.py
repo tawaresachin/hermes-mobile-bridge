@@ -204,6 +204,7 @@ class AgentLoop:
         attachment_url: str = "",
         attachment_type: str = "",
         multi_agent: bool = False,
+        model_override: str = "",
     ) -> AsyncGenerator[str, None]:
         """
         Run the agent loop for a new user query.
@@ -228,8 +229,11 @@ class AgentLoop:
             return
 
         # ─── Multi-agent mode: ruflo swarm on the full Hermes agent ───
+        # The swarm runs with the APP's session model (model_override) so
+        # Telegram's hermes config never leaks into app-driven turns — no
+        # mix between the two sides.
         if multi_agent:
-            async for event in self._run_ruflo(query):
+            async for event in self._run_ruflo(query, model_override):
                 yield event
             yield sse_done()
             return
@@ -345,7 +349,7 @@ class AgentLoop:
     # Multi-agent mode: ruflo swarm (full Hermes agent, 8 specialists)
     # ─────────────────────────────────────────────────────────────────────
 
-    async def _run_ruflo(self, query: str) -> AsyncGenerator[str, None]:
+    async def _run_ruflo(self, query: str, model_override: str = "") -> AsyncGenerator[str, None]:
         """Stream a query through `hermes chat -s ruflo` (the multi-agent
         swarm harness). Runs as an async subprocess, yielding each line as
         SSE text — minutes-long runs arrive progressively, not in a lump.
@@ -353,7 +357,10 @@ class AgentLoop:
         Falls back to plain `hermes chat -q` if the ruflo skill is missing,
         so the toggle never hard-fails."""
         hermes_bin = os.getenv("HERMES_BIN", "hermes")
-        cmd = [hermes_bin, "chat", "-q", query.strip(), "-s", "ruflo"]
+        cmd = [hermes_bin, "chat", "-q", query.strip()]
+        if model_override:
+            cmd += ["-m", model_override]
+        cmd += ["-s", "ruflo"]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
