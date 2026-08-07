@@ -552,6 +552,18 @@ def _read_attachment_content(attach_url: str, attach_type: str) -> str:
         return ""
 
 
+def _inject_reply_context(openai_messages: list[dict], reply_to: str | None) -> None:
+    """Attach a Telegram-style reply quote to the last user message.
+    Prompt-only context — never persisted to history. The last message is
+    the just-saved query (single user message after sanitization)."""
+    if not reply_to or not reply_to.strip():
+        return
+    for m in reversed(openai_messages):
+        if m["role"] == "user":
+            m["content"] = f'[Replying to your previous message: "{reply_to[:500]}"]\n\n{m["content"]}'
+            return
+
+
 def _build_openai_messages(session_id: str) -> list[dict]:
     """Build the conversation history array for the OpenAI-compatible API.
     Reads uploaded file content from local storage and embeds it as text.
@@ -633,6 +645,9 @@ class ChatRequest(BaseModel):
     attachment_url: Optional[str] = Field(default=None, max_length=512)
     attachment_type: Optional[str] = Field(default=None, max_length=32)
     multi_agent: bool = False
+    # Telegram-style reply: quoted text of the message being replied to.
+    # Injected into the model prompt (NOT persisted in history).
+    reply_to: Optional[str] = Field(default=None, max_length=2_000)
 
 
 class TtsRequest(BaseModel):
@@ -1818,6 +1833,7 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     # Load conversation history — off the event loop: attachment reads / OCR
     # (subprocess, up to 30s) must never block other requests.
     openai_messages = await asyncio.to_thread(_build_openai_messages, session_id)
+    _inject_reply_context(openai_messages, body.reply_to)
 
     # Use session-scoped model override if available
     effective_model = _resolve_model(session_id)
@@ -1930,6 +1946,7 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     )
 
     openai_messages = await asyncio.to_thread(_build_openai_messages, session_id)
+    _inject_reply_context(openai_messages, body.reply_to)
     # List + join: O(n) — string += in a loop is O(n²) for long responses
     response_chunks: list[str] = []
     reasoning_chunks: list[str] = []
