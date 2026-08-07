@@ -557,16 +557,25 @@ def _build_openai_messages(session_id: str) -> list[dict]:
     Reads uploaded file content from local storage and embeds it as text.
     Echoes back reasoning_content (DeepSeek thinking mode) — DeepSeek
     requires it on follow-up turns or it returns 400.
-    Does NOT include a system prompt — AgentLoop adds its own."""
+    Does NOT include a system prompt — AgentLoop adds its own.
+
+    Sanitizes poisoned history: blank replies used to be saved as '' (the
+    pre-fix server skipped nothing), leaving user,user,user chains that
+    violate role alternation — deepseek answers 200 with EMPTY content.
+    Empty entries are dropped and consecutive same-role entries merged.
+    """
     msgs = load_messages(session_id)
     result = []
-    # Full history — AgentLoop.run() compacts it (rolling summary + recent
-    # window). Slicing to 20 here starved the compaction and silently
-    # dropped everything beyond the last 20 messages in long sessions.
     for m in msgs:
-        content = m["content"]
+        content = m["content"] or ""
+        role = m["role"]
         attach_url = m.get("attachment_url", "")
         attach_type = m.get("attachment_type", "")
+
+        # Drop empty entries (blank assistant replies from the pre-fix era)
+        # — an empty message breaks strict role alternation.
+        if not content.strip() and not m.get("reasoning_content"):
+            continue
 
         if attach_url:
             file_snippet = _read_attachment_content(attach_url, attach_type)
@@ -576,17 +585,42 @@ def _build_openai_messages(session_id: str) -> list[dict]:
             else:
                 label = "Image" if attach_type and "image" in attach_type else "File"
                 enhanced += f"\n\n[{label} attached: {attach_url}]"
-            entry: dict = {"role": m["role"], "content": enhanced}
+            entry: dict = {"role": role, "content": enhanced}
             if m.get("reasoning_content"):
                 entry["reasoning_content"] = m["reasoning_content"]
-            result.append(entry)
         else:
-            entry = {"role": m["role"], "content": content}
+            entry = {"role": role, "content": content}
             # Echo back DeepSeek's reasoning_content from prior assistant turns
             if m.get("reasoning_content"):
                 entry["reasoning_content"] = m["reasoning_content"]
-            result.append(entry)
-    return result
+
+        # Collapse consecutive same-role entries (the blank-reply bug left
+        # user,user,user chains) — keep the first, merge the text.
+        if result and result[-1]["role"] == entry["role"]:
+            prev = result[-1]
+            prev_content = prev.get("content") or ""
+            if content.strip():
+                prev["content"] = f"{prev_content}\n\n{content}" if prev_content.strip() else content
+            if not prev.get("reasoning_content") and entry.get("reasoning_content"):
+                prev["reasoning_content"] = entry["reasoning_content"]
+            continue
+        result.append(entry)
+
+    # Drop orphan tool messages (a tool result with no matching assistant
+    # tool_calls entry — old malformed runs could leave those too).
+    cleaned = []
+    pending_ids: set = set()
+    for e in result:
+        if e["role"] == "assistant" and e.get("tool_calls"):
+            pending_ids = {tc["id"] for tc in e["tool_calls"]}
+            cleaned.append(e)
+        elif e["role"] == "tool":
+            if e.get("tool_call_id") in pending_ids:
+                cleaned.append(e)
+            # orphan — drop silently
+        else:
+            cleaned.append(e)
+    return cleaned
 
 
 # ─── Models ──────────────────────────────────────────────────────────────
