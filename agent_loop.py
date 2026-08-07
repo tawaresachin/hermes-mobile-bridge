@@ -357,7 +357,10 @@ class AgentLoop:
         Falls back to plain `hermes chat -q` if the ruflo skill is missing,
         so the toggle never hard-fails."""
         hermes_bin = os.getenv("HERMES_BIN", "hermes")
-        cmd = [hermes_bin, "chat", "-q", query.strip()]
+        # Run under the isolated 'swarm' profile: provider pinned to the
+        # bridge's own Omnirouter router, so the app's model always resolves
+        # correctly and Telegram's hermes config is never read or affected.
+        cmd = [hermes_bin, "--profile", "swarm", "chat", "-q", query.strip()]
         if model_override:
             cmd += ["-m", model_override]
         cmd += ["-s", "ruflo"]
@@ -412,7 +415,7 @@ class AgentLoop:
         """Single-query fallback: `hermes chat -q` without skills."""
         hermes_bin = os.getenv("HERMES_BIN", "hermes")
         proc = await asyncio.create_subprocess_exec(
-            hermes_bin, "chat", "-q", query.strip(),
+            hermes_bin, "--profile", "swarm", "chat", "-q", query.strip(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ},
