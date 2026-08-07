@@ -361,21 +361,27 @@ class AgentLoop:
             env={**os.environ},
         )
         try:
-            # Stream stdout line-by-line; trim the trailing
-            # "Session: … Duration: …" footer hermes appends.
-            saw_footer = False
+            # Stream stdout line-by-line; drop ruflo/TUI noise (box art,
+            # skill warnings, the "Session:/Resume" footer) so the app only
+            # sees the answer.
+            noise_prefixes = (
+                "Warning: Unknown toolsets",
+                "Query: ",
+                "Initializing agent",
+                "Resume this session with",
+                "Session:",
+                "Duration:",
+                "Messages:",
+            )
+            box_borders = ("╭", "├", "╰", "─", "╮", "╯", "╼", "╽", "│")
             assert proc.stdout is not None
             async for raw in proc.stdout:
                 line = raw.decode(errors="replace").rstrip("\n")
-                if not line.strip():
+                stripped = line.strip()
+                if not stripped or stripped.startswith(box_borders):
                     continue
-                if line.strip().startswith("Session:"):
-                    saw_footer = True
+                if stripped.startswith(noise_prefixes):
                     continue
-                if saw_footer and not line.strip():
-                    continue
-                if line.strip():
-                    saw_footer = False
                 yield sse_text(line)
         except asyncio.CancelledError:
             proc.kill()
