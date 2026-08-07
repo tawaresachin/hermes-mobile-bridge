@@ -255,6 +255,13 @@ class AgentLoop:
             enhanced_prompt = enhanced_prompt + summary_block
 
         iteration = 0
+        # Empty-response retry: reasoning models (deepseek-v4-flash-free via
+        # OmniRoute) SOMETIMES return only reasoning_content and stop — no
+        # answer, no tool call. One retry usually gets a real answer; a
+        # silent blank is worse than a slightly slower reply.
+        empty_retried = False
+        total_emitted_text = ""
+        any_tool_events = False
         while iteration < self.MAX_ITERATIONS:
             iteration += 1
             full_response = ""
@@ -270,6 +277,7 @@ class AgentLoop:
                     return
                 elif event_type == "text":
                     full_response += event.get("content", "")
+                    total_emitted_text += event.get("content", "")
                     yield sse_text(event.get("content", ""))
                 elif event_type == "reasoning":
                     full_reasoning += event.get("content", "")
@@ -296,6 +304,12 @@ class AgentLoop:
                     text_ids.add(key)
 
             if not tool_calls:
+                # Reasoning-only stop: the model 'thought' and returned no
+                # answer. Retry once — the follow-up call (same messages)
+                # usually completes; the free tier is flaky like that.
+                if not full_response.strip() and not empty_retried:
+                    empty_retried = True
+                    continue
                 # AI is done — no more tool calls
                 break
 
@@ -321,6 +335,7 @@ class AgentLoop:
             result_texts = []
             for tc in tool_calls:
                 yield sse_tool_call(tc)  # status=running
+                any_tool_events = True
 
                 result = await self.tools.execute(tc)
 
@@ -337,6 +352,11 @@ class AgentLoop:
             # Loop back to let AI process tool results
 
         # AI finished without (more) tool calls — we're done
+        # Last-resort guard: if the model produced NOTHING (no text, no tool
+        # events) even after the empty-retry, tell the user instead of a
+        # silent blank bubble.
+        if not total_emitted_text and not any_tool_events:
+            yield sse_text("(model returned no response — try again or switch model)")
         yield sse_done()
 
     # ─────────────────────────────────────────────────────────────────────
