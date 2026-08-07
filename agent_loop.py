@@ -299,16 +299,23 @@ class AgentLoop:
                 # AI is done — no more tool calls
                 break
 
-            # Persist any assistant text spoken alongside the tool calls —
-            # otherwise the next AI iteration loses it (context loss).
-            if full_response.strip():
-                msg_entry: dict = {
-                    "role": "assistant",
-                    "content": full_response,
-                }
-                if full_reasoning:
-                    msg_entry["reasoning_content"] = full_reasoning
-                all_messages.append(msg_entry)
+            # Persist the assistant turn as ONE message: spoken text + tool
+            # calls together. Two consecutive "assistant" messages (text,
+            # then tool_calls) violate role alternation and make some
+            # providers return 200 with EMPTY content — the blank-reply bug.
+            tc_entries = [{
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+            } for tc in tool_calls]
+            msg_entry: dict = {
+                "role": "assistant",
+                "content": full_response or None,
+                "tool_calls": tc_entries,
+            }
+            if full_reasoning:
+                msg_entry["reasoning_content"] = full_reasoning
+            all_messages.append(msg_entry)
 
             # --- Execute each tool ---
             result_texts = []
@@ -320,19 +327,6 @@ class AgentLoop:
                 yield sse_tool_result(result)
                 result_texts.append(f"Tool '{tc.name}' returned: {result.output or result.error}")
 
-                # Add assistant tool call to conversation history
-                tc_entry: dict = {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
-                    }],
-                }
-                if full_reasoning:
-                    tc_entry["reasoning_content"] = full_reasoning
-                all_messages.append(tc_entry)
                 # Add tool result to conversation history
                 all_messages.append({
                     "role": "tool",
