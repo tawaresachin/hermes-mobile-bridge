@@ -2318,11 +2318,12 @@ SETUP_PAGE_HTML = """<!DOCTYPE html>
       <div class="ok-email" id="okemail"></div>
       <div class="qr-wrap"><img id="qr" alt="Sign-in QR code"></div>
       <ol>
-        <li>Open <b>Hermes</b> app on your phone (v2.17.1+)</li>
-        <li>Go to <b>Settings → Add Connection</b></li>
-        <li>Tap <b>Scan QR code</b> and point at this screen</li>
-        <li>Done — the app signs in as your account</li>
+        <li>Open the <b>Hermes</b> app on your phone</li>
+        <li>Go to <b>Settings</b> and tap <b>Scan QR Code</b></li>
+        <li>Point the camera at this QR code</li>
+        <li>Done — the app connects and signs in as your account</li>
       </ol>
+      <div class="hint" style="margin-top:10px">The QR expires in 15 minutes. If it runs out, tap “Register / log in another account” below and sign in again.</div>
       <button type="button" class="btn" id="backbtn">← Register / log in another account</button>
       <div class="msg" id="msg2"></div>
     </div>

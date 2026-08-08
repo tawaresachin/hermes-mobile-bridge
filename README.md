@@ -71,10 +71,17 @@ No Tailscale? Cloudflare tunnel is the automatic fallback (kept fresh by the sup
 - `POST /api/chat/stream` — SSE streaming chat (OpenAI-compatible)
 - `POST /api/chat` — non-streaming chat
 - `GET /api/sessions` — list sessions
+- `GET /api/sessions/{id}/messages` — a session's stored messages (resume-repair)
+- `DELETE /api/sessions/{id}` — delete a session
 - `GET /api/models` — live model list (never hardcoded)
 - `POST /api/models/switch` — switch active model (session or global)
 - `POST /api/tts` — edge-tts synthesis (per-language voices, cached)
-- `GET /setup/qr` — QR pairing for the app
+- `POST /api/stt` — whisper.cpp transcription (voice screen)
+- `POST /api/upload` — attachment upload (chat attachments)
+- `GET /setup` — browser pairing page (create account → claim QR)
+- `GET /setup/qr` — QR pairing PNG for the app
+- `GET /setup/connect` — connection JSON (route-aware URL)
+- `POST /auth/register` · `POST /auth/login` — account auth (JWT)
 
 ## Config
 
@@ -82,7 +89,7 @@ No Tailscale? Cloudflare tunnel is the automatic fallback (kept fresh by the sup
 |---|---|---|
 | `PORT` | `9119` | Server port |
 | `HOST` | `0.0.0.0` | Bind address |
-| `HERMES_API_KEY` | `hermes123` | API key for mobile app auth |
+| `HERMES_API_KEY` | *(empty — set it in `.env`)* | API key for mobile app auth; handed to the app automatically via the setup QR |
 | `AI_BASE_URL` | `http://localhost:20128/v1` | OpenAI-compatible API base |
 | `AI_MODEL` | `auto/best-coding` | Active model |
 | `TTS_VOICE` | `en-IN-NeerjaNeural` | Default edge-tts voice |
