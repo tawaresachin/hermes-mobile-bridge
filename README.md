@@ -25,7 +25,7 @@ Idempotent — run it once on a fresh machine, re-run it any time to update:
 | **Re-run (update)** | force-reinstalls the plugin → `git pull` the server → restarts the server |
 | **No Hermes CLI** | standalone mode: clones server + deps → runs `python3 server.py` |
 
-Flags: `--no-serve` (install/update only) · `--force` · `--dir DIR` · `--port PORT`.
+Flags: `--no-serve` (install/update only) · `--no-stt` (skip whisper) · `--dir DIR` · `--port PORT`.
 
 Requires: Python 3.9+ and git (both needed by Hermes itself anyway).
 
@@ -145,6 +145,7 @@ BRIDGE_TTS_PROVIDER=hermes
 
 ## Security
 
-- Path traversal neutralized: session IDs are SHA-256 hashed before use in filenames
+- Path traversal neutralized: session IDs are client-controlled and get
+  scrubbed to `[A-Za-z0-9_-]` before any filesystem use
 - TTS voice comes from a fixed enum on the app side (no injection surface)
-- Auth: Bearer `HERMES_API_KEY` or JWT (register/login endpoints)
+- Auth: Bearer `HERMES_API_KEY` or JWT (register/login endpoints, rate-limited)
