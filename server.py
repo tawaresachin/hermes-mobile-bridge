@@ -1929,12 +1929,28 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
                                 reasoning_chunks.append(data.get('content', ''))
                         except (json.JSONDecodeError, IndexError):
                             pass
-                outcome["text"] = "".join(response_chunks)
-                outcome["reasoning"] = "".join(reasoning_chunks)
+                # SAVE INSIDE THE TASK — the generator may be cancelled by a
+                # client disconnect at any moment; only the task is guaranteed
+                # to reach the save.
+                full_text = "".join(response_chunks)
+                reasoning = "".join(reasoning_chunks)
+                if full_text.strip():
+                    logger.info(
+                        f"Saving assistant response for session {session_id} "
+                        f"({len(full_text)} chars)"
+                    )
+                    _save_assistant_message(
+                        session_id, full_text, reasoning_content=reasoning)
+                else:
+                    logger.warning(
+                        f"Empty full_assistant_response for session {session_id}")
             except asyncio.CancelledError:
-                # Our task is only cancelled at shutdown — still save what we have.
-                outcome["text"] = "".join(response_chunks)
-                outcome["reasoning"] = "".join(reasoning_chunks)
+                # Task cancelled only at server shutdown — save what we have.
+                full_text = "".join(response_chunks)
+                if full_text.strip():
+                    _save_assistant_message(
+                        session_id, full_text,
+                        reasoning_content="".join(reasoning_chunks))
             except Exception as e:
                 logger.error(f"Stream error for session {session_id}: {e}")
                 outcome["error"] = str(e)
@@ -1958,19 +1974,6 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             if outcome["error"] is not None:
                 friendly = "Agent error while generating response. Try again or switch model."
                 yield f"data: {json.dumps({'type': 'error', 'content': f'⚠ {friendly}'})}\n\n"
-            # Save assistant response (skip whitespace-only turns — they'd
-            # show as blank rows/gaps in the app's chat).
-            if outcome["text"].strip():
-                logger.info(
-                    f"Saving assistant response for session {session_id} "
-                    f"({len(outcome['text'])} chars)"
-                )
-                _save_assistant_message(
-                    session_id, outcome["text"],
-                    reasoning_content=outcome["reasoning"],
-                )
-            else:
-                logger.warning(f"Empty full_assistant_response for session {session_id}")
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
             # Client disconnected — do NOT cancel the agent task; it keeps
