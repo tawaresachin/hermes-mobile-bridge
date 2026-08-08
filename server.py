@@ -1103,6 +1103,24 @@ async def list_sessions(user: dict = Depends(verify_bearer)):
     return [s for s in load_sessions() if s.get("owner_id") == uid]
 
 
+@app.get("/api/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str, user: dict = Depends(verify_bearer)):
+    """Fetch a session's stored messages (owner-scoped). Used by the app to
+    re-sync the last response when a stream was interrupted client-side
+    (tab switch / process death) — the server is the source of truth."""
+    uid = int(user["sub"])
+    if not _can_use_session(session_id, uid):
+        return JSONResponse(status_code=403, content={"detail": "Not your session"})
+    msgs_path = _messages_path(session_id)
+    if not msgs_path.exists():
+        return []
+    try:
+        data = json.loads(msgs_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
     """Delete a session and its messages (owner-scoped)."""
