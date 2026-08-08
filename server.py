@@ -1892,56 +1892,99 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     )
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        # List + join: O(n) — string += in a loop is O(n²) for long streams
-        response_chunks: list[str] = []
-        reasoning_chunks: list[str] = []
-        full_assistant_response = ""
-        try:
-            async for event in loop.run(openai_messages, query, session_id=session_id,
-                                         attachment_url=body.attachment_url or "",
-                                         attachment_type=body.attachment_type or "",
-                                         multi_agent=body.multi_agent,
-                                         model_override=_resolve_model(session_id)):
-                yield event
-                # Collect text + reasoning for saving
-                if event.startswith('data: {'):
-                    try:
-                        raw = event[6:].strip()
-                        data = json.loads(raw)
-                        if data.get('type') == 'text':
-                            response_chunks.append(data.get('content', ''))
-                        elif data.get('type') == 'reasoning':
-                            reasoning_chunks.append(data.get('content', ''))
-                    except (json.JSONDecodeError, IndexError):
-                        pass
-            full_assistant_response = "".join(response_chunks)
-        except asyncio.CancelledError:
-            # Client disconnected — save what we have
-            logger.warning(f"Stream cancelled for session {session_id}, saving partial response")
-            if full_assistant_response.strip():
-                _save_assistant_message(
-                    session_id, full_assistant_response,
-                    reasoning_content="".join(reasoning_chunks),
-                )
-            return
-        except Exception as e:
-            logger.error(f"Stream error for session {session_id}: {e}")
-            # Don't leak raw internals to the app — log detail, send friendly text
-            friendly = "Agent error while generating response. Try again or switch model."
-            yield f"data: {json.dumps({'type': 'error', 'content': f'⚠ {friendly}'})}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+        # ── Detached-generation design ──────────────────────────────────
+        # The agent runs in a BACKGROUND TASK, NOT in the SSE generator.
+        # If the client disconnects (user leaves the chat, app killed, tab
+        # switch, network blip), the generator is cancelled — but the task
+        # keeps running to completion and SAVES the response. Without this,
+        # a disconnect cancelled the agent mid-run and the response was
+        # lost server-side (the app's resume-repair could never recover it).
+        event_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=64)
+        done = asyncio.Event()
+        outcome: dict = {"error": None, "text": "", "reasoning": ""}
 
-        # Save assistant response to history (skip whitespace-only turns —
-        # they'd show as blank rows/gaps in the app's chat).
-        if full_assistant_response.strip():
-            logger.info(f"Saving assistant response for session {session_id} ({len(full_assistant_response)} chars)")
-            _save_assistant_message(
-                session_id, full_assistant_response,
-                reasoning_content="".join(reasoning_chunks),
-            )
-        else:
-            logger.warning(f"Empty full_assistant_response for session {session_id}")
+        async def run_agent() -> None:
+            response_chunks: list[str] = []
+            reasoning_chunks: list[str] = []
+            try:
+                async for event in loop.run(
+                    openai_messages, query, session_id=session_id,
+                    attachment_url=body.attachment_url or "",
+                    attachment_type=body.attachment_type or "",
+                    multi_agent=body.multi_agent,
+                    model_override=_resolve_model(session_id)):
+                    # Non-blocking: if the client is gone, drop events rather
+                    # than block the task — we still collect + save the text.
+                    try:
+                        event_queue.put_nowait(event)
+                    except asyncio.QueueFull:
+                        pass
+                    if event.startswith('data: {'):
+                        try:
+                            raw = event[6:].strip()
+                            data = json.loads(raw)
+                            if data.get('type') == 'text':
+                                response_chunks.append(data.get('content', ''))
+                            elif data.get('type') == 'reasoning':
+                                reasoning_chunks.append(data.get('content', ''))
+                        except (json.JSONDecodeError, IndexError):
+                            pass
+                outcome["text"] = "".join(response_chunks)
+                outcome["reasoning"] = "".join(reasoning_chunks)
+            except asyncio.CancelledError:
+                # Our task is only cancelled at shutdown — still save what we have.
+                outcome["text"] = "".join(response_chunks)
+                outcome["reasoning"] = "".join(reasoning_chunks)
+            except Exception as e:
+                logger.error(f"Stream error for session {session_id}: {e}")
+                outcome["error"] = str(e)
+            finally:
+                done.set()
+
+        task = asyncio.create_task(run_agent())
+        try:
+            # Stream to the client while the task runs. On disconnect the
+            # generator is cancelled — the task survives and saves.
+            while not done.is_set():
+                try:
+                    event = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+                    yield event
+                except asyncio.TimeoutError:
+                    continue
+            # Drain any events produced in the final instant
+            while not event_queue.empty():
+                yield event_queue.get_nowait()
+
+            if outcome["error"] is not None:
+                friendly = "Agent error while generating response. Try again or switch model."
+                yield f"data: {json.dumps({'type': 'error', 'content': f'⚠ {friendly}'})}\n\n"
+            # Save assistant response (skip whitespace-only turns — they'd
+            # show as blank rows/gaps in the app's chat).
+            if outcome["text"].strip():
+                logger.info(
+                    f"Saving assistant response for session {session_id} "
+                    f"({len(outcome['text'])} chars)"
+                )
+                _save_assistant_message(
+                    session_id, outcome["text"],
+                    reasoning_content=outcome["reasoning"],
+                )
+            else:
+                logger.warning(f"Empty full_assistant_response for session {session_id}")
+            yield "data: [DONE]\n\n"
+        except asyncio.CancelledError:
+            # Client disconnected — do NOT cancel the agent task; it keeps
+            # running and saves the response. Re-raise to close the stream.
+            raise
+        finally:
+            # If we got here cleanly, reap the task; if cancelled, the task
+            # outlives this generator by design (detached generation).
+            if not task.done():
+                # Give it a moment; do NOT cancel on client disconnect.
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
 
     return StreamingResponse(
         event_generator(),
