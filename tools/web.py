@@ -30,7 +30,10 @@ async def fetch_safe(url: str, headers: dict | None = None, max_hops: int = 5, c
         if not is_safe_url(current):
             return None, "⚠ Refusing to fetch non-public URL (blocked private/loopback host)"
         req = http.build_request("GET", current, headers=headers)
-        resp = await http.send(req, stream=True)
+        # follow_redirects=False FORCED at send: a client configured with
+        # follow_redirects=True would auto-follow a Location header to a
+        # private/loopback host before this loop ever re-validates it.
+        resp = await http.send(req, stream=True, follow_redirects=False)
         if resp.status_code in _REDIRECT_STATUSES:
             location = resp.headers.get("location")
             await resp.aclose()

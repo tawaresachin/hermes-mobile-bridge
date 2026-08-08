@@ -49,7 +49,9 @@ FRESH_WINDOW_HOURS = 48
 _UA_HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"}
 
 _http = httpx.AsyncClient(
-    timeout=SOURCE_TIMEOUT, follow_redirects=True, headers=_UA_HEADERS
+    # follow_redirects=False: fetch_safe walks + validates each hop itself;
+    # auto-following here would bypass the per-hop SSRF re-check.
+    timeout=SOURCE_TIMEOUT, follow_redirects=False, headers=_UA_HEADERS
 )
 
 _STOP_WORDS = frozenset(

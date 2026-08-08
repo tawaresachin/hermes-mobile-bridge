@@ -161,6 +161,14 @@ class AuthDB:
         return hashlib.sha256(token.encode()).hexdigest()
 
     @_synchronized
+    def get_user_email(self, user_id: int) -> Optional[str]:
+        """Email for a user id — locked (shared-connection safety)."""
+        row = self._get_conn().execute(
+            "SELECT email FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    @_synchronized
     def create_refresh_token(self, user_id: int) -> tuple[str, int]:
         """Generate a new refresh token. Returns (raw_token, expires_at)."""
         conn = self._get_conn()

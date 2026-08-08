@@ -111,19 +111,10 @@ async def register_user(store_path: Path, email: str, password: str) -> dict:
     user = await asyncio.to_thread(auth_db.create_user, email, password)
     secret = get_jwt_secret(store_path)
     access = create_access_token(user.id, user.email, secret)
-    refresh_raw, _ = generate_refresh_token()
-    refresh_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
-    # Store refresh token
-    auth_db._get_conn().execute(
-        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
-        (
-            refresh_hash,
-            user.id,
-            int(time.time()) + REFRESH_EXPIRE_DAYS * 86400,
-            int(time.time()),
-        ),
-    )
-    auth_db._get_conn().commit()
+    # Store refresh token via the LOCKED method — the shared sqlite
+    # connection must never be touched outside @_synchronized
+    # (interleaved transactions raise "cannot commit - no transaction").
+    refresh_raw, _ = auth_db.create_refresh_token(user.id)
     return {
         "token": access,
         "refresh_token": refresh_raw,
@@ -143,18 +134,8 @@ async def login_user(store_path: Path, email: str, password: str) -> Optional[di
         return None
     secret = get_jwt_secret(store_path)
     access = create_access_token(user.id, user.email, secret)
-    refresh_raw, _ = generate_refresh_token()
-    refresh_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
-    auth_db._get_conn().execute(
-        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
-        (
-            refresh_hash,
-            user.id,
-            int(time.time()) + REFRESH_EXPIRE_DAYS * 86400,
-            int(time.time()),
-        ),
-    )
-    auth_db._get_conn().commit()
+    # Locked method — see register_user for why.
+    refresh_raw, _ = auth_db.create_refresh_token(user.id)
     return {
         "token": access,
         "refresh_token": refresh_raw,
@@ -170,28 +151,15 @@ async def refresh_tokens(store_path: Path, refresh_token: str) -> Optional[dict]
     user_id = auth_db.verify_refresh_token(refresh_token)
     if not user_id:
         return None
-    # Get user email
-    row = auth_db._get_conn().execute(
-        "SELECT email FROM users WHERE id = ?", (user_id,)
-    ).fetchone()
-    if not row:
+    # Locked methods — the shared sqlite connection must only be touched
+    # under @_synchronized.
+    email = auth_db.get_user_email(user_id)
+    if not email:
         return None
-    email = row[0]
     # Issue new tokens
     secret = get_jwt_secret(store_path)
     access = create_access_token(user_id, email, secret)
-    refresh_raw, _ = generate_refresh_token()
-    refresh_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
-    auth_db._get_conn().execute(
-        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
-        (
-            refresh_hash,
-            user_id,
-            int(time.time()) + REFRESH_EXPIRE_DAYS * 86400,
-            int(time.time()),
-        ),
-    )
-    auth_db._get_conn().commit()
+    refresh_raw, _ = auth_db.create_refresh_token(user_id)
     return {
         "token": access,
         "refresh_token": refresh_raw,

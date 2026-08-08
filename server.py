@@ -361,10 +361,27 @@ def _messages_path(session_id: str) -> Path:
     return STORE_PATH / f"messages_{safe}.json"
 
 
+def _valid_session_id(session_id: str) -> bool:
+    """Reject malformed session ids at the API boundary.
+
+    Sanitizing (as _messages_path does) would let a request for
+    ``victim!`` collide with the victim's ``messages_victim.json`` —
+    the ownership gate checks the RAW id, so the collision bypasses it.
+    Rejecting the id outright closes that hole (same rule /api/upload uses)."""
+    return bool(session_id) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id) is not None
+
+
 # Serializes load-modify-save on sessions.json / messages_*.json. Without
 # it, two concurrent turns on the same session both read, both write — one
 # update is silently lost and messageCount regresses.
 _FS_LOCK = threading.Lock()
+
+# ─── Detached generation task cap ───────────────────────────────────────
+# Burst disconnects must not stack unbounded agent runs (each holds an
+# LLM stream, tool subprocesses and response buffers). A semaphore gates
+# concurrent runs; a done-callback discards the reference + frees the slot.
+_AGENT_TASK_SEM = asyncio.Semaphore(4)
+_AGENT_TASKS: set["asyncio.Task"] = set()
 
 
 def load_sessions() -> list[dict]:
@@ -490,6 +507,8 @@ def _read_attachment_content(attach_url: str, attach_type: str) -> str:
             return ""
         sess = parts[2]
         fname = "/".join(parts[3:])
+        if not _valid_session_id(sess):
+            return ""
         fpath = UPLOADS_DIR / sess / fname
         # Path-traversal guard: resolved path MUST stay inside the uploads dir
         resolved = fpath.resolve()
@@ -974,21 +993,14 @@ async def auth_claim(body: ClaimRequest):
     user_id = _validate_claim(body.token)
     if user_id is None:
         raise HTTPException(status_code=401, detail="Invalid or expired claim token")
-    row = auth_db._get_conn().execute(
-        "SELECT email FROM users WHERE id = ?", (user_id,)
-    ).fetchone()
-    if not row:
+    # Locked methods — the shared sqlite connection must only be touched
+    # under @_synchronized.
+    email = auth_db.get_user_email(user_id)
+    if not email:
         raise HTTPException(status_code=401, detail="User not found")
-    email = row[0]
     secret = get_jwt_secret(STORE_PATH)
     access = create_access_token(user_id, email, secret)
-    refresh_raw, _ = generate_refresh_token()
-    refresh_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
-    auth_db._get_conn().execute(
-        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
-        (refresh_hash, user_id, int(time.time()) + 30 * 86400, int(time.time())),
-    )
-    auth_db._get_conn().commit()
+    refresh_raw, _ = auth_db.create_refresh_token(user_id)
     return {"token": access, "refresh_token": refresh_raw, "user_id": str(user_id), "email": email}
 
 
@@ -1109,6 +1121,8 @@ async def get_session_messages(session_id: str, user: dict = Depends(verify_bear
     re-sync the last response when a stream was interrupted client-side
     (tab switch / process death) — the server is the source of truth."""
     uid = int(user["sub"])
+    if not _valid_session_id(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
     if not _can_use_session(session_id, uid):
         return JSONResponse(status_code=403, content={"detail": "Not your session"})
     msgs_path = _messages_path(session_id)
@@ -1125,6 +1139,8 @@ async def get_session_messages(session_id: str, user: dict = Depends(verify_bear
 async def delete_session(session_id: str, user: dict = Depends(verify_bearer)):
     """Delete a session and its messages (owner-scoped)."""
     uid = int(user["sub"])
+    if not _valid_session_id(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
     if not _can_use_session(session_id, uid):
         return JSONResponse(status_code=403, content={"detail": "Not your session"})
     sessions = [s for s in load_sessions() if s.get("id") != session_id]
@@ -1838,6 +1854,8 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
     """Streaming chat endpoint with full agent tool execution."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
     uid = int(user["sub"])
+    if body.session_id and not _valid_session_id(body.session_id):
+        return JSONResponse(status_code=400, content={"detail": "Invalid session_id"})
     if not _can_use_session(session_id, uid):
         return JSONResponse(status_code=403, content={"detail": "Not your session"})
 
@@ -1957,7 +1975,19 @@ async def chat_stream(body: ChatRequest, user: dict = Depends(verify_bearer)):
             finally:
                 done.set()
 
-        task = asyncio.create_task(run_agent())
+        await _AGENT_TASK_SEM.acquire()
+        try:
+            task = asyncio.create_task(run_agent())
+        except BaseException:
+            _AGENT_TASK_SEM.release()
+            raise
+        _AGENT_TASKS.add(task)
+
+        def _task_done(t: asyncio.Task) -> None:
+            _AGENT_TASKS.discard(t)
+            _AGENT_TASK_SEM.release()
+
+        task.add_done_callback(_task_done)
         try:
             # Stream to the client while the task runs. On disconnect the
             # generator is cancelled — the task survives and saves.
@@ -2004,6 +2034,8 @@ async def chat_sync(body: ChatRequest, user: dict = Depends(verify_bearer)):
     """Non-streaming chat endpoint with full agent tool execution."""
     session_id = body.session_id or uuid.uuid4().hex[:8]
     uid = int(user["sub"])
+    if body.session_id and not _valid_session_id(body.session_id):
+        return JSONResponse(status_code=400, content={"detail": "Invalid session_id"})
     if not _can_use_session(session_id, uid):
         return JSONResponse(status_code=403, content={"detail": "Not your session"})
 
